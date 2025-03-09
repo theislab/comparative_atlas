@@ -119,7 +119,7 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         n_latent: int = 10,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
-        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
+        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene-cell",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         **model_kwargs,
     ):
