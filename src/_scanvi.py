@@ -928,7 +928,8 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         #check this may need to be old_model_batch_extend instead
         model.module.old_params =  [
                 (k, p.clone().detach())
-                for k, p in old_model.module.named_parameters() if requires_penalty(k)
+                for k, p in old_model.module.named_parameters() if p.requires_grad
+                # for k, p in old_model.module.named_parameters() if requires_penalty(k)
             ]
         # old_params = [
         #         (k, p.clone().detach())
@@ -985,7 +986,8 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             loss = scvi_loss.loss
             loss.backward()
 
-            param_dict = [ (n,p) for n,p in model.module.named_parameters() if requires_penalty(n)]
+            # param_dict = [ (n,p) for n,p in model.module.named_parameters() if requires_penalty(n)]
+            param_dict = [ (n,p) for n,p in model.module.named_parameters() if p.requires_grad]
 
 
             for (k1, p), (k2, imp) in zip(
@@ -1049,7 +1051,8 @@ def zerolike_params_dict(model):
 
     return [
         (k, torch.zeros_like(p).to(p.device))
-        for k, p in model.named_parameters() if requires_penalty(k)
+        for k, p in model.named_parameters() if p.requires_grad
+        # for k, p in model.named_parameters() if requires_penalty(k)
     ]
 
      
