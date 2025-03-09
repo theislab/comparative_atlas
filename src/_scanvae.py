@@ -451,7 +451,7 @@ class SCANVAE(VAE_GR):
                     self.importances,
                 ):
             if cur_param.size() == saved_param.size():
-                penalty += ((imp * ctrl_imp) * (cur_param - saved_param).pow(2)).sum()
+                penalty += ((imp + ctrl_imp) * (cur_param - saved_param).pow(2)).sum()
             else:
                 penalty += 0.0
             
