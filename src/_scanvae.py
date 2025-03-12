@@ -101,7 +101,6 @@ class SCANVAE(VAE_GR):
         classifier_parameters: dict = dict(),
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
-        combine_type: Literal["additive","product"] = "product",
         # n_control: int = None,
         **vae_kwargs
     ):
@@ -119,7 +118,6 @@ class SCANVAE(VAE_GR):
             gene_likelihood=gene_likelihood,
             use_batch_norm=use_batch_norm,
             use_layer_norm=use_layer_norm,
-            combine_type=combine_type,
             **vae_kwargs
         )
 
@@ -128,7 +126,8 @@ class SCANVAE(VAE_GR):
         use_layer_norm_encoder = use_layer_norm == "encoder" or use_layer_norm == "both"
         use_layer_norm_decoder = use_layer_norm == "decoder" or use_layer_norm == "both"
 
-        self.combine_type = combine_type
+        # hard-code for now
+        self.combine_type = "product"
         
         self.n_labels = n_labels
         # Classifier takes n_latent as input
