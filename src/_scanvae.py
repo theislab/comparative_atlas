@@ -15,22 +15,13 @@ from scvi.nn import Decoder, Encoder
 
 from scvi.module._classifier import Classifier
 from scvi.module._utils import broadcast_labels
-# from scvi.module._vae import VAE
-from ._vae import VAE_GR
+from scvi.module._vae import VAE
+# from ._vae import VAE_GR
 
 from typing import NamedTuple
 
-class EXTRA_KEYS(NamedTuple):
-    REPLAY_Z_KEY: str =  'replay_z_key'
-    REPLAY_X_KEY: str =  'replay_x_key'
-    REPLAY_BATCH_KEY: str = 'replay_batch_key'
-    REPLAY_LABELS_KEY: str = 'replay_labels_key'
 
-
-EXTRA_KEYS = EXTRA_KEYS()
-
-
-class SCANVAE(VAE_GR):
+class SCANVAE(VAE):
     """
     Single-cell annotation using variational inference.
     This is an implementation of the scANVI model described in [Xu21]_,
@@ -267,36 +258,22 @@ class SCANVAE(VAE_GR):
         replay=False,
     ):
         
-        if not replay:
-            px_r = generative_outputs["px_r"]
-            px_rate = generative_outputs["px_rate"]
-            px_dropout = generative_outputs["px_dropout"]
-            qz1_m = inference_outputs["qz_m"]
-            qz1_v = inference_outputs["qz_v"]
-            z1 = inference_outputs["z"]
-            x = tensors[REGISTRY_KEYS.X_KEY]
-            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
-            if feed_labels:
-                y = tensors[REGISTRY_KEYS.LABELS_KEY]
-            else:
-                y = None
-            is_labelled = False if y is None else True
+        
+        px_r = generative_outputs["px_r"]
+        px_rate = generative_outputs["px_rate"]
+        px_dropout = generative_outputs["px_dropout"]
+        qz1_m = inference_outputs["qz_m"]
+        qz1_v = inference_outputs["qz_v"]
+        z1 = inference_outputs["z"]
+        x = tensors[REGISTRY_KEYS.X_KEY]
+        batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+        if feed_labels:
+            y = tensors[REGISTRY_KEYS.LABELS_KEY]
         else:
-            px_r = generative_outputs["px_r_replay"]
-            px_rate = generative_outputs["px_rate_replay"]
-            px_dropout = generative_outputs["px_dropout_replay"]
-            qz1_m = inference_outputs["qz_m_replay"]
-            qz1_v = inference_outputs["qz_v_replay"]
-            z1 = inference_outputs["z_replay"]
-            x = tensors[EXTRA_KEYS.REPLAY_X_KEY]
-            batch_index = tensors[EXTRA_KEYS.REPLAY_BATCH_KEY]
-            if feed_labels:
-                y = tensors[EXTRA_KEYS.REPLAY_LABELS_KEY]
-            else:
-                y = None
-            is_labelled = False if y is None else True
+            y = None
+        is_labelled = False if y is None else True
+        
             
-
         # Enumerate choices of label
         ys, z1s = broadcast_labels(y, z1, n_broadcast=self.n_labels)
         qz2_m, qz2_v, z2 = self.encoder_z2_z1(z1s, ys)
@@ -304,21 +281,6 @@ class SCANVAE(VAE_GR):
         
         
         reconst_loss = self.get_reconstruction_loss(x, px_rate, px_r, px_dropout)
-
-
-        # # replay stats
-        # if EXTRA_KEYS.REPLAY_X_KEY in tensors.keys():
-        #     x_replay = tensors[EXTRA_KEYS.REPLAY_X_KEY]
-        #     px_rate_replay = generative_outputs["px_rate_replay"]
-        #     px_r_replay = generative_outputs["px_r_replay"]
-        #     px_dropout_replay = generative_outputs["px_dropout_replay"]
-        #     reconst_loss_replay = self.get_reconstruction_loss(x_replay, px_rate_replay, px_r_replay, px_dropout_replay)
-
-        # else:
-        #     x_replay = px_rate_replay = px_r_replay = px_dropout_replay = None
-        #     reconst_loss_replay = torch.tensor(0.0)
-        
-
 
 
         # KL Divergence
@@ -425,16 +387,8 @@ class SCANVAE(VAE_GR):
             **loss_kwargs
         )
 
-        if EXTRA_KEYS.REPLAY_X_KEY in tensors.keys():
-            losses_replay = self.loss(
-                tensors, 
-                inference_outputs, 
-                generative_outputs,
-                replay=True,
-                **loss_kwargs
-            )
-        else:
-            losses_replay = None
+        
+        losses_replay = None
 
        
         
