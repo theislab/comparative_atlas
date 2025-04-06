@@ -700,7 +700,7 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         #         for k, p in old_model.module.named_parameters() if requires_penalty(k)
         #     ]
         # model.module.register_buffer("old_params", old_params)
-        model.module.register_buffer ("ref_px_r", model.module.px_r)
+        # model.module.register_buffer ("ref_px_r", model.module.px_r)
 
         
         
