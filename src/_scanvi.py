@@ -56,16 +56,6 @@ logger = logging.getLogger(__name__)
 # adds-on
 from typing import NamedTuple
 
-class EXTRA_KEYS(NamedTuple):
-    REPLAY_Z_KEY: str =  'replay_z_key'
-    REPLAY_X_KEY: str =  'replay_x_key'
-    REPLAY_BATCH_KEY: str = 'replay_batch_key'
-    REPLAY_LABELS_KEY: str = 'replay_labels_key'
-
-
-EXTRA_KEYS = EXTRA_KEYS()
-
-
 
 class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
     """
@@ -512,232 +502,14 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         return torch.cat(latent).numpy() 
     
     
-    #repurpose minification for adding replay data
-    def minify_adata(
-        self,
-        adata,
-        replay_x_key: str,
-        replay_z_key: str,
-        replay_batch_key: str, 
-        replay_labels_key: str,
-        minified_data_type = 'REPLAY_ADATA',
-    ) -> None:
-        """Minifies the model's adata.
-
-        Minifies the adata, and registers new anndata fields: latent qzm, latent qzv, adata uns
-        containing minified-adata type, and library size.
-        This also sets the appropriate property on the module to indicate that the adata is
-        minified.
-
-        Parameters
-        ----------
-        minified_data_type
-            How to minify the data. Currently only supports `latent_posterior_parameters`.
-            If minified_data_type == `latent_posterior_parameters`:
-
-            * the original count data is removed (`adata.X`, adata.raw, and any layers)
-            * the parameters of the latent representation of the original data is stored
-            * everything else is left untouched
-        use_latent_qzm_key
-            Key to use in `adata.obsm` where the latent qzm params are stored
-        use_latent_qzv_key
-            Key to use in `adata.obsm` where the latent qzv params are stored
-
-        Notes
-        -----
-        The modification is not done inplace -- instead the model is assigned a new (minified)
-        version of the adata.
-        """
-        
-        self._update_adata_and_manager_post_minification(adata, replay_x_key, replay_z_key, replay_batch_key, replay_labels_key)
-        self.module.minified_data_type = minified_data_type
-        
-    def _update_adata_and_manager_post_minification(
-        self,
-        adata: AnnData,
-        replay_x_key: str, 
-        replay_z_key: str,
-        replay_batch_key: str,
-        replay_labels_key: str,
-    ):
-        """Update the :class:`~anndata.AnnData` and :class:`~scvi.data.AnnDataManager` in-place.
-
-        Parameters
-        ----------
-        minified_adata
-            Minified version of :attr:`~scvi.model.base.BaseModelClass.adata`.
-        minified_data_type
-            Method used for minifying the data.
-        keep_count_data
-            If ``True``, the full count matrix is kept in the minified
-            :attr:`~scvi.model.base.BaseModelClass.adata`.
-        """
-        self._validate_anndata(adata)
-        new_adata_manager = self.get_anndata_manager(adata, required=True)
-
-        # replay/rehearsal 
-        replay_anndata_fields = [
-            ObsmField(
-                    EXTRA_KEYS.REPLAY_Z_KEY,
-                    replay_z_key,         
-            ),
-            ObsmField(
-                    EXTRA_KEYS.REPLAY_X_KEY,
-                    replay_x_key,          
-            ),
-            CategoricalObsField(EXTRA_KEYS.REPLAY_BATCH_KEY, replay_batch_key),
-            CategoricalObsField(EXTRA_KEYS.REPLAY_LABELS_KEY, replay_labels_key),
-        ]
-        new_adata_manager.register_new_fields(
-            replay_anndata_fields
-        )
-        # self.adata = minified_adata
-
-    # def register_new_fields(self, fields):
-    #     """Register new fields to a manager instance.
-
-    #     This is useful to augment the functionality of an existing manager.
-
-    #     Parameters
-    #     ----------
-    #     fields
-    #         List of AnnDataFields to register
-    #     """
-    #     if self.adata is None:
-    #         raise AssertionError(
-    #             "No AnnData object has been registered with this Manager instance."
-    #         )
-    #     self.validate()
-    #     for field in fields:
-    #         self._add_field(
-    #             field=field,
-    #             adata=self.adata,
-    #         )
-
-    #     # Source registry is not None if this manager was created from transfer_fields
-    #     # In this case self._registry is originally equivalent to self._source_registry
-    #     # However, with newly registered fields the equality breaks so we reset it
-    #     if self._source_registry is not None:
-    #         self._source_registry = deepcopy(self._registry)
-
-    #     self.fields += fields
-
-    # def _add_field(
-    #     self,
-    #     field,
-    #     adata: AnnData,
-    #     source_registry,
-    #     **transfer_kwargs,
-    # ):
-    #     """Internal function for adding a field with optional transferring."""
-    #     field_registries = self._registry[_constants._FIELD_REGISTRIES_KEY]
-    #     field_registries[field.registry_key] = {
-    #         _constants._DATA_REGISTRY_KEY: field.get_data_registry(),
-    #         _constants._STATE_REGISTRY_KEY: {},
-    #     }
-    #     field_registry = field_registries[field.registry_key]
-
-    #     # A field can be empty if the model has optional fields (e.g. extra covariates).
-    #     # If empty, we skip registering the field.
-    #     if not field.is_empty:
-    #         # Transfer case: Source registry is used for validation and/or setup.
-    #         if source_registry is not None:
-    #             field_registry[_constants._STATE_REGISTRY_KEY] = field.transfer_field(
-    #                 source_registry[_constants._FIELD_REGISTRIES_KEY][field.registry_key][
-    #                     _constants._STATE_REGISTRY_KEY
-    #                 ],
-    #                 adata,
-    #                 **transfer_kwargs,
-    #             )
-    #         else:
-    #             field_registry[_constants._STATE_REGISTRY_KEY] = field.register_field(adata)
-    #     # Compute and set summary stats for the given field.
-    #     state_registry = field_registry[_constants._STATE_REGISTRY_KEY]
-    #     field_registry[_constants._SUMMARY_STATS_KEY] = field.get_summary_stats(state_registry)
-    
-    
-    # @classmethod
-    # def importances_from_reference(
-    #     cls,
-    #     adata: AnnData,
-    #     control_uns_key: str = None,
-    #     replay_uns_key: str = None,
-    # ):   
-    
-    # @torch.no_grad()
-    # def get_latent_representation(
-    #     self,
-    #     adata: Optional[AnnData] = None,
-    #     indices: Optional[Sequence[int]] = None,
-    #     give_mean: bool = True,
-    #     mc_samples: int = 5000,
-    #     batch_size: Optional[int] = None,
-    #     ignore_replay=False,
-    # ) -> np.ndarray:
-    #     r"""
-    #     Return the latent representation for each cell.
-
-    #     This is denoted as :math:`z_n` in our manuscripts.
-
-    #     Parameters
-    #     ----------
-    #     adata
-    #         AnnData object with equivalent structure to initial AnnData. If `None`, defaults to the
-    #         AnnData object used to initialize the model.
-    #     indices
-    #         Indices of cells in adata to use. If `None`, all cells are used.
-    #     give_mean
-    #         Give mean of distribution or sample from it.
-    #     mc_samples
-    #         For distributions with no closed-form mean (e.g., `logistic normal`), how many Monte Carlo
-    #         samples to take for computing mean.
-    #     batch_size
-    #         Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
-
-    #     Returns
-    #     -------
-    #     latent_representation : np.ndarray
-    #         Low-dimensional representation for each cell
-    #     """
-    #     self._check_if_trained(warn=False)
-
-    #     adata = self._validate_anndata(adata)
-    #     scdl = self._make_data_loader(
-    #         adata=adata, indices=indices, batch_size=batch_size
-    #     )
-            
-    #     latent = []
-    #     for tensors in scdl:
-    #         inference_inputs = self.module._get_inference_input(tensors)
-    #         outputs = self.module.inference(**inference_inputs)
-    #         qz_m = outputs["qz_m"]
-    #         qz_v = outputs["qz_v"]
-    #         z = outputs["z"]
-
-    #         if give_mean:
-    #             # does each model need to have this latent distribution param?
-    #             if self.module.latent_distribution == "ln":
-    #                 samples = Normal(qz_m, qz_v.sqrt()).sample([mc_samples])
-    #                 z = torch.nn.functional.softmax(samples, dim=-1)
-    #                 z = z.mean(dim=0)
-    #             else:
-    #                 z = qz_m
-
-    #         latent += [z.cpu()]
-    #     return torch.cat(latent).numpy()
-
         
     @classmethod
     def load_query_data_with_replay(
         cls,
         adata: AnnData,
         reference_model: Union[str, BaseModelClass],
-        replay_x_key: str = None, 
-        replay_z_key: str = None,
-        replay_batch_key: str = None, 
         control_uns_key: str = None,
         replay_uns_key: str = None,
-        replay_labels_key: str=None,
         inplace_subset_query_vars: bool = False,
         use_gpu: Optional[Union[str, int, bool]] = None,
         unfrozen: bool = True, # fully unfrozen model. Overrides everything else
@@ -882,14 +654,6 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             # model.control_size,
         )
 
-        # CLEAN AFTER TEST RUN ----------------
-#         # Initialize with replay tensors
-#         rehearsal_manager = model.replay_adata_manager
-#         rdl = AnnDataLoader(rehearsal_manager, shuffle=False, batch_size=replay_size) # batch_size=128
-#         model.module.replay_tensors = next(tensors for tensors in rdl)
-#         # move replay tensors to device
-#         for key, val in model.module.replay_tensors.items():
-#             model.module.replay_tensors[key] = val.to(device)
 
         
 
@@ -939,12 +703,7 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         model.module.register_buffer ("ref_px_r", model.module.px_r)
 
         
-        if replay_x_key is not None:
-            model.minify_adata(adata, 
-                               replay_x_key=replay_x_key,
-                               replay_z_key=replay_z_key,
-                               replay_batch_key=replay_batch_key,
-                               replay_labels_key=replay_labels_key)
+        
         return model 
     
  
