@@ -39,7 +39,7 @@ Perform incremental update with regularization from (1) and (2).
 
 ```bash
 git clone https://github.com/theislab/comparative_atlas
-cd your-repo
+cd comparative_atlas
 ```
 
 ## 2. Setup a conda environment
@@ -73,7 +73,7 @@ N=200
 
 unc_scores, score_idx  = SCANVI.get_uncertainty(adata, 
                                                 ref_model, 
-                                                order='top-k', 
+                                                order='step', 
                                                 num_points = num_points_bi,
                                                 tta_rep = N)
 
