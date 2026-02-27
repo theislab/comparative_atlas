@@ -38,7 +38,7 @@ Perform incremental update with regularization from (1) and (2).
 ## 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-org/your-repo.git
+git clone https://github.com/theislab/comparative_atlas
 cd your-repo
 ```
 
@@ -47,5 +47,5 @@ Use the `.yml` file provided in the repo
 
 ``` bash
 conda env create -f environment.yml
-conda activate comparative-atlas
+conda activate cscanvi
 ```
