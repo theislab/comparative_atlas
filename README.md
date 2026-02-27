@@ -124,6 +124,6 @@ query_model.train(
 
 # Reproducibility
 
-The scANVI models of the CRC all-lineage, Epithelial lineage and NK-T cell lineage integrations, and the notebooks to reproduce the figures from the manuscript will be released progressively.
+The scANVI models of the comparative CRC all-lineage, Epithelial lineage and NK-T cell lineage integrations, and the notebooks to reproduce the figures from the manuscript will be released progressively.
 
 # Citation
