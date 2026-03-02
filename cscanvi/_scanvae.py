@@ -249,9 +249,7 @@ class SCANVAE(VAE):
         inference_outputs,
         generative_outputs,
         feed_labels=False,
-        replay_importance=None, # placeholder, not used
-        ewc_importance=None, # placeholder, not used
-        l2_ewc=None, # placeholder, not used
+        ewc_importance=0,
         kl_weight=1,
         labelled_tensors=None,
         classification_ratio=None,
@@ -325,14 +323,14 @@ class SCANVAE(VAE):
                     kl_locals,
                     classification_loss=classifier_loss,
                     n_labelled_tensors=labelled_tensors[REGISTRY_KEYS.X_KEY].shape[0],
-                    #reconst_loss_replay=reconst_loss_replay,
+                    
                 )
             return LossRecorder(
                 loss,
                 reconst_loss,
                 kl_locals,
                 kl_global=torch.tensor(0.0),
-                #reconst_loss_replay=reconst_loss_replay,
+                
             )
 
         probs = self.classifier(z1)
@@ -359,7 +357,7 @@ class SCANVAE(VAE):
                 reconst_loss,
                 kl_divergence,
                 classification_loss=classifier_loss,
-                #reconst_loss_replay=reconst_loss_replay,
+                
             )
         return LossRecorder(loss, reconst_loss, kl_divergence, #reconst_loss_replay=reconst_loss_replay
                            )
@@ -376,9 +374,8 @@ class SCANVAE(VAE):
        
     ):
         loss_kwargs = _get_dict_if_none(loss_kwargs)
-        replay_importance = loss_kwargs['replay_importance']
         ewc_importance = loss_kwargs['ewc_importance']
-        l2_ewc = loss_kwargs['l2_ewc']
+        
         
         losses = self.loss(
             tensors, 
@@ -388,7 +385,7 @@ class SCANVAE(VAE):
         )
 
         
-        losses_replay = None
+        
 
        
         
@@ -417,16 +414,11 @@ class SCANVAE(VAE):
                 penalty += 0.0
             
         
-        # # ELBO loss - assumes replay_importance is in loss_kwargs
-        if losses_replay is not None:
-            loss_total = losses.loss + ewc_importance*penalty + replay_importance*losses_replay.loss
-        else:
-            loss_total = losses.loss + ewc_importance*penalty 
+        loss_total = losses.loss + ewc_importance*penalty
+             
 
         return LossRecorder(
             loss_total, losses.reconstruction_loss, losses.kl_local, 
-            replay_reconst_loss=torch.mean(losses_replay.reconstruction_loss) if losses_replay is not None else torch.tensor(0.0),
-            replay_kl_loss=torch.mean(losses_replay.kl_local) if losses_replay is not None else torch.tensor(0.0),
             ewc_loss = penalty,
             # ctrl_ewc_loss = penalty_ctrl
         )  # note the component of this LossRecorder different from original
