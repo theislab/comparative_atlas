@@ -60,7 +60,7 @@ from cscanvi._scanvi import SCANVI
 ```
 
 Construct a Replay Buffer by computing the Bregman Information metric for each cell.
-Here we select 20% of cells from the reference model , `ref_model`. The gene expression counts from the atlas are stored in `adata`. We compute BI by generating 200 augmentations to score each, then choose cells following the 'step' approach. 
+Here we select 20% of cells from the reference model , `ref_model`. The gene expression counts from the atlas are stored in `adata`. We compute BI by generating 200 augmentations to score each, then choose cells following the `step` approach. 
 
 ```python
 import scvi
