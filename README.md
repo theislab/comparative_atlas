@@ -127,3 +127,15 @@ query_model.train(
 The scANVI models of the comparative CRC all-lineage, Epithelial lineage and NK-T cell lineage integrations, and the notebooks to reproduce the figures from the manuscript will be released progressively.
 
 # Citation
+
+If you use this work, please cite:
+
+```bibtex
+@article{hediyehzadeh2026perturbation,
+  title={Perturbation-guided mapping of colorectal cancer cell states to causal mechanisms},
+  author={Hediyeh-zadeh, Soroor and Toh, Tzen S. and Dufva, Olli and Serra, Giuseppe and Jackmola, Rashika and Fourneaux, Camille and Pinto, Goncalo and Fang, Zijian and Picco, Gabriele and Oliver, Amanda J. and Elmentaite, Rasa and Richter, Till and To, Ken and Pett, J. Patrick and Teichmann, Sarah A. and Azizi, Elham and Buettner, Florian and Theis, Fabian J. and Garnett, Mathew J.},
+  journal={bioRxiv},
+  year={2026},
+  doi={10.64898/2026.03.03.708171}
+}
+```
