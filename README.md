@@ -1,7 +1,7 @@
 
 <img width="1694" height="646" alt="Supp_fig_modelOverview" src="https://github.com/user-attachments/assets/56a5846d-05d2-4987-8b44-7afc59d59979" />
 
-# Incremental comparative Atlas Construction with Bregman-Regularized Replay
+# Incremental Comparative Atlas Construction with Bregman-Regularized Replay
 
 
 This repository implements an incremental comparative atlas construction framework using:
