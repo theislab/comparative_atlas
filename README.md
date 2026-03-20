@@ -52,7 +52,7 @@ conda activate cscanvi
 
 # Quick start
 
-Here we provide an example on training a `scANVI` model incrementally. 
+Here we provide an example on training a `scANVI` model incrementally. You can download a simulated case–control PBMC scRNA-seq dataset—featuring increased IFN signaling in monocytes from case samples—along with the corresponding reference model from ![this link](10.6084/m9.figshare.31825075). 
 
 Import the modified `SCANVI` class from source
 ```python
