@@ -20,7 +20,7 @@ The pipeline consists of four stages:
 
 ### Input
 - **Integrated reference atlas** (multi-study healthy reference)
-- **Case–control query data**
+- **Case–control query data** (multi-study)
 
 ### (1) Compute Bregman Information → Create Replay Buffer
 Select informative reference cells to preserve during continual training.
@@ -127,3 +127,16 @@ query_model.train(
 The scANVI models of the comparative CRC all-lineage, Epithelial lineage and NK-T cell lineage integrations, and the notebooks to reproduce the figures from the manuscript will be released progressively.
 
 # Citation
+
+If you use this project, please cite:
+```bibtex
+@article{hediyeh2026perturbation,
+  title={Perturbation-guided mapping of colorectal cancer cell states to causal mechanisms},
+  author={Hediyeh-zadeh, Soroor and Toh, Tzen S and Dufva, Olli and Serra, Giuseppe and Jackmola, Rashika and Fourneaux, Camille and Pinto, Goncalo and Fang, Zijian and Picco, Gabriele and Oliver, Amanda J and others},
+  journal={bioRxiv},
+  pages={2026--03},
+  year={2026},
+  publisher={Cold Spring Harbor Laboratory}
+}
+
+```
