@@ -128,7 +128,7 @@ The scANVI models of the comparative CRC all-lineage, Epithelial lineage and NK-
 
 **Update**
 
-Integrated objects and the associated metadata is now available on [HugginFace](https://huggingface.co/datasets/theislab/CRC_comparative/tree/main) 
+Integrated objects and the associated metadata is now available on [HuggingFace](https://huggingface.co/datasets/theislab/CRC_comparative/tree/main) 
 
 # Citation
 
