@@ -52,7 +52,11 @@ conda activate cscanvi
 
 # Quick start
 
-Here we provide an example on training a `scANVI` model incrementally. You can download a simulated case–control PBMC scRNA-seq dataset—featuring increased IFN signaling in monocytes from case samples—along with the corresponding reference model from [this link](https://doi.org/10.6084/m9.figshare.31825075). 
+Here we provide an example on training a `scANVI` model incrementally. 
+
+> [!TIP]
+> You can download a simulated case–control PBMC scRNA-seq dataset—featuring increased IFN signaling in monocytes from case samples—along with the corresponding reference model from [this link](https://doi.org/10.6084/m9.figshare.31825075). 
+
 
 Import the modified `SCANVI` class from source
 ```python
@@ -120,15 +124,17 @@ query_model.train(
     **train_kwargs_surgery, 
 )
 ```
-
+> [!IMPORTANT]
+> A very strong regularization can terminate training pre-maturely. 
 
 # Reproducibility
 
 The scANVI models of the comparative CRC all-lineage, Epithelial lineage and NK-T cell lineage integrations, and the notebooks to reproduce the figures from the manuscript will be released progressively.
 
-**Update**
 
-Integrated objects and the associated metadata is now available on [HuggingFace](https://huggingface.co/datasets/theislab/CRC_comparative/tree/main) 
+> [!NOTE]
+> Integrated objects and the associated metadata is now available on [HuggingFace](https://huggingface.co/datasets/theislab/CRC_comparative/tree/main)
+
 
 # Citation
 
