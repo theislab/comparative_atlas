@@ -127,7 +127,8 @@ query_model.train(
 The scANVI models of the comparative CRC all-lineage, Epithelial lineage and NK-T cell lineage integrations, and the notebooks to reproduce the figures from the manuscript will be released progressively.
 
 **Update**
-Integrated objects and the associated metadata is now available on [HugginFace] (https://huggingface.co/datasets/theislab/CRC_comparative/tree/main) 
+
+Integrated objects and the associated metadata is now available on [HugginFace](https://huggingface.co/datasets/theislab/CRC_comparative/tree/main) 
 
 # Citation
 
