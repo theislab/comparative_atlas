@@ -14,7 +14,7 @@ The workflow enables robust case–control integration without catastrophic forg
 
 ---
 
-# Overview of the Method
+## Overview of the Method
 
 The pipeline consists of four stages:
 
@@ -33,16 +33,16 @@ Perform incremental update with regularization from (1) and (2).
 
 ---
 
-# Installation
+## Installation
 
-## 1. Clone the Repository
+### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/theislab/comparative_atlas
 cd comparative_atlas
 ```
 
-## 2. Setup a conda environment
+### 2. Setup a conda environment
 Use the `.yml` file provided in the repo
 
 ``` bash
@@ -50,7 +50,7 @@ conda env create -f environment.yml
 conda activate cscanvi
 ```
 
-# Quick start
+## Quick start
 
 Here we provide an example on training a `scANVI` model incrementally. 
 
@@ -127,7 +127,7 @@ query_model.train(
 > [!IMPORTANT]
 > A very strong regularization can terminate training pre-maturely. 
 
-# Reproducibility
+## Reproducibility
 
 The scANVI models of the comparative CRC all-lineage, Epithelial lineage and NK-T cell lineage integrations, and the notebooks to reproduce the figures from the manuscript will be released progressively.
 
@@ -136,7 +136,7 @@ The scANVI models of the comparative CRC all-lineage, Epithelial lineage and NK-
 > Integrated objects and the associated metadata is now available on [HuggingFace](https://huggingface.co/datasets/theislab/CRC_comparative/tree/main).
 
 
-# Citation
+## Citation
 
 If you use this project, please cite:
 ```bibtex
