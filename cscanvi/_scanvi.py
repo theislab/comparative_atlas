@@ -408,8 +408,8 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             use_gpu=use_gpu,
         )
         training_plan = CLSemiSupervisedTrainingPlan(self.module, **plan_kwargs)
-        if "callbacks" in trainer_kwargs.keys():
-            trainer_kwargs["callbacks"].concatenate(sampler_callback)
+        if "callbacks" in trainer_kwargs.keys() and trainer_kwargs["callbacks"] is not None:
+            trainer_kwargs["callbacks"] = list(trainer_kwargs["callbacks"]) + sampler_callback
         else:
             trainer_kwargs["callbacks"] = sampler_callback
 
