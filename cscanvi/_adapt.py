@@ -11,10 +11,30 @@ from scvi.distributions import NegativeBinomial
 from torch.distributions import Normal
 from torch.distributions import kl_divergence as kl
 import torch
+import numpy as np
 from typing import Optional, Tuple, Union
 from torch.linalg import vector_norm
 
 class Adapt(SCANVAE):
+    """Adaptation module: map scGPT embeddings into the SCANVI latent space.
+
+    The module wraps a pretrained SCANVI backbone (``m0``) and adds:
+
+    * ``projection_layer``: scGPT embedding → latent
+    * ``decoder``: latent → ``X_target`` (marker-gene counts)
+    * ``px_r_m0``: NB dispersion for the adaptation decoder
+
+    ``Adapt.z_encoder`` (inherited from :class:`SCANVAE`) is **not** used in
+    the training objective. Latent alignment always compares
+    ``projection_layer(embedding)`` to ``m0.z_encoder(gene counts)``.
+
+    Stage 1 trains only ``projection_layer``, ``decoder``, and ``px_r_m0``
+    while ``m0`` is frozen. Stage 2 (via :class:`TTA_SCANVI`) additionally
+    trains ``m0`` with SCANVI replay + EWC on full ``adata.X``, while the
+    adaptation head reconstructs ``X_target`` and aligns to ``m0`` latents on
+    the same cells.
+    """
+
     def __init__(
         self, 
         m0_module: SCANVAE,
@@ -75,6 +95,9 @@ class Adapt(SCANVAE):
         self.use_embedding_for_inference = True
         self.stage1_x_m1 = None
         self.stage1_embedding = None
+        # Full-dataset adaptation tensors for stage 2 (all query + replay cells).
+        self.stage2_x_m1 = None
+        self.stage2_embedding = None
 
         # EWC state. Empty until `register_ewc_anchor` is called; while empty the
         # penalty computed in `SCANVAE.loss_with_replay` is 0 (the zip is empty).
@@ -88,15 +111,112 @@ class Adapt(SCANVAE):
     def _get_inference_input(self, tensors):
         """Build inference inputs for adaptation.
 
-        In adaptation mode we run the Adapt encoder on the embedding tensor
-        instead of the SCANVI-registered count matrix ``X``. This decouples the
-        adaptation path from SCANVI registry dimensions (e.g. 512-d embedding vs
-        4917 genes) and prevents encoder shape mismatches.
+        In stage-1 adaptation mode (``use_embedding_for_inference=True``) we run
+        the Adapt encoder on the embedding tensor instead of the
+        SCANVI-registered count matrix ``X``. This decouples the adaptation path
+        from SCANVI registry dimensions (e.g. 512-d embedding vs 4917 genes).
+
+        In stage-2 continual mode (``use_embedding_for_inference=False``) the
+        batches are gene counts and the Adapt encoder (sized for the embedding
+        modality) cannot consume them, so we route the standard ``X`` path
+        through the reference/continual backbone ``m0``.
         """
+        if not self.use_embedding_for_inference:
+            return self.m0._get_inference_input(tensors)
         inputs = super()._get_inference_input(tensors)
-        if self.use_embedding_for_inference and "embedding" in tensors:
+        if "embedding" in tensors:
             inputs["x"] = tensors["embedding"]
         return inputs
+
+    def inference(self, *args, **kwargs):
+        """Encode inputs.
+
+        In stage-2 continual mode the gene-count ``X`` path is delegated to the
+        ``m0`` backbone so the embedding-sized Adapt encoder is bypassed.
+        """
+        if not self.use_embedding_for_inference:
+            return self.m0.inference(*args, **kwargs)
+        return super().inference(*args, **kwargs)
+
+    def _get_generative_input(self, tensors, inference_outputs, **kwargs):
+        if not self.use_embedding_for_inference:
+            return self.m0._get_generative_input(tensors, inference_outputs, **kwargs)
+        return super()._get_generative_input(tensors, inference_outputs, **kwargs)
+
+    def generative(self, *args, **kwargs):
+        if not self.use_embedding_for_inference:
+            return self.m0.generative(*args, **kwargs)
+        return super().generative(*args, **kwargs)
+
+    def set_stage2_adaptation_tensors(self, embedding, x_m1):
+        """Cache per-cell adaptation tensors aligned with stage-2 ``adata`` rows."""
+        self.stage2_embedding = torch.as_tensor(
+            np.asarray(embedding), dtype=torch.float32
+        )
+        self.stage2_x_m1 = torch.as_tensor(np.asarray(x_m1), dtype=torch.float32)
+
+    def _inject_stage2_adapt_tensors(self, tensors):
+        """Add ``embedding`` / ``x_m1`` to a gene-count batch via row indices."""
+        if not isinstance(tensors, dict):
+            tensors = dict(tensors)
+        if (
+            "embedding" not in tensors
+            and self.stage2_embedding is not None
+            and REGISTRY_KEYS.INDICES_KEY in tensors
+        ):
+            batch_indices = tensors[REGISTRY_KEYS.INDICES_KEY].long()
+            device = next(self.parameters()).device
+            tensors["embedding"] = self.stage2_embedding[batch_indices].to(device)
+        if (
+            "x_m1" not in tensors
+            and self.stage2_x_m1 is not None
+            and REGISTRY_KEYS.INDICES_KEY in tensors
+        ):
+            batch_indices = tensors[REGISTRY_KEYS.INDICES_KEY].long()
+            device = next(self.parameters()).device
+            tensors["x_m1"] = self.stage2_x_m1[batch_indices].to(device)
+        return tensors
+
+    def _adaptation_head_loss(self, tensors, m0_inference_outputs):
+        """Shared adaptation objective (stage 1 and stage 2).
+
+        * NB reconstruction of ``x_m1`` from scgpt ``embedding`` via
+          ``projection_layer`` + ``decoder``
+        * Energy score aligning ``projection_layer(embedding)`` to the latent
+          ``z`` from the **frozen/trainable** ``m0`` gene-count encoder (not
+          ``Adapt.z_encoder``).
+        """
+        if "embedding" not in tensors or "x_m1" not in tensors:
+            raise KeyError(
+                "Adaptation loss expected `embedding` and `x_m1` in tensors. "
+                f"Available keys: {list(tensors.keys())}"
+            )
+        emb = tensors["embedding"]
+        x_m1 = tensors["x_m1"]
+        z_proj = self.projection_layer(emb)
+        library_emb = torch.log(x_m1.sum(dim=1, keepdim=True).clamp_min(1e-8))
+        _, _, px_rate_emb, _ = self.decoder("gene", z_proj, library_emb)
+        theta = torch.exp(self.px_r_m0.clamp(min=-12, max=12))
+        if theta.shape[-1] != px_rate_emb.shape[-1]:
+            raise ValueError(
+                "Adapt decoder output and px_r_m0 must match X_target gene "
+                f"dimension (got px_rate {px_rate_emb.shape[-1]} vs "
+                f"px_r_m0 {theta.shape[-1]}). Ensure stage-2 setup does not "
+                "overwrite px_r_m0 with m0.px_r."
+            )
+        reconst_loss_emb = -NegativeBinomial(mu=px_rate_emb, theta=theta).log_prob(
+            x_m1
+        ).sum(dim=-1)
+        m0_z = m0_inference_outputs["z"]
+        if not any(p.requires_grad for p in self.m0.parameters()):
+            m0_z = m0_z.detach()
+        energy_score_loss = self.energy_loss(m0_z, z_proj, verbose=False)
+        loss = (reconst_loss_emb + energy_score_loss).mean()
+        return LossRecorder(
+            loss=loss,
+            reconstruction_loss=reconst_loss_emb.mean(),
+            energy_score_loss=energy_score_loss.mean(),
+        )
 
     @auto_move_data
     def _replay_forward(
@@ -119,7 +239,11 @@ class Adapt(SCANVAE):
         adaptation tensors (`embedding`, `x_m1`) instead of SCANVI replay `X`.
         """
         if not self.use_embedding_for_inference:
-            return super()._replay_forward(
+            # Stage-2: same cells, two objectives on one batch.
+            #   (1) gene-count SCANVI replay + EWC via ``m0``
+            #   (2) scgpt reconstruction + energy alignment (projection z vs m0 z)
+            tensors = self._inject_stage2_adapt_tensors(tensors)
+            m0_out = self.m0._replay_forward(
                 tensors,
                 get_inference_input_kwargs=get_inference_input_kwargs,
                 get_generative_input_kwargs=get_generative_input_kwargs,
@@ -128,6 +252,21 @@ class Adapt(SCANVAE):
                 loss_kwargs=loss_kwargs,
                 compute_loss=compute_loss,
             )
+            if not compute_loss:
+                return m0_out
+
+            m0_inf_out, m0_gen_out, m0_losses = m0_out
+            adapt_losses = self._adaptation_head_loss(tensors, m0_inf_out)
+            total_loss = m0_losses.loss + adapt_losses.loss
+            combined = LossRecorder(
+                total_loss,
+                m0_losses.reconstruction_loss + adapt_losses.reconstruction_loss,
+                m0_losses.kl_local,
+                ewc_loss=getattr(m0_losses, "ewc_loss", torch.zeros_like(total_loss)),
+                adapt_reconstruction_loss=adapt_losses.reconstruction_loss.detach(),
+                energy_score_loss=adapt_losses.energy_score_loss.detach(),
+            )
+            return m0_inf_out, m0_gen_out, combined
 
         get_inference_input_kwargs = (
             {} if get_inference_input_kwargs is None else get_inference_input_kwargs
@@ -385,63 +524,43 @@ class Adapt(SCANVAE):
         # ``loss_kwargs`` (feed_labels, labelled_tensors, classification_ratio,
         # kl_weight, ewc_importance, ...) are accepted for compatibility with
         # the ``loss_with_replay`` call path but are not used by this objective.
+        #
+        # Latent alignment uses ``m0``'s gene-count encoder (``m0.z``), not
+        # ``Adapt.z_encoder``. ``inference_outputs`` from Adapt is ignored.
 
-        # Input embedding
-        emb = tensors.get("embedding", tensors[REGISTRY_KEYS.X_KEY])
-        if "x_m1" in tensors:
-            x_m1 = tensors["x_m1"]
-        elif self.stage1_x_m1 is not None:
-            batch_indices = tensors[REGISTRY_KEYS.INDICES_KEY].long()
-            x_m1 = self.stage1_x_m1[batch_indices].to(emb.device)
-        else:
-            raise KeyError(
-                "Adapt.loss requires `x_m1` tensor (or `stage1_x_m1` cache in stage-1 mode)."
-            )
-        z_emb = self.projection_layer(emb)
-        library_emb = torch.log(x_m1.sum(dim=1, keepdim=True).clamp_min(1e-8))
-        px_scale_emb, px_r_emb, px_rate_emb, px_dropout_emb = self.decoder("gene", z_emb, library_emb)
-        # m0 was trained with "gene" dispersion: px_r is a raw parameter.
-        # Clamp before exp for numerical stability.
-        theta_m0 = torch.exp(self.px_r_m0.clamp(min=-12, max=12))
-        reconst_loss_emb = -NegativeBinomial(mu=px_rate_emb, theta=theta_m0).log_prob(x_m1).sum(dim=-1)
-        loss_m0_value = torch.tensor(0.0, device=x_m1.device)
-        loss_m0_reconstruction = torch.tensor(0.0, device=x_m1.device)
-        if self.use_m0_loss:
-            # Build an explicit forward pass for the reference m0 objective.
-            # This keeps the reference path decoupled from adaptation tensors.
-            m0_tensors = dict(tensors)
-            if "x_m0" in tensors:
-                m0_tensors[REGISTRY_KEYS.X_KEY] = tensors["x_m0"]
-            m0_inference_inputs = self.m0._get_inference_input(m0_tensors)
+        m0_tensors = dict(tensors)
+        m0_inference_inputs = self.m0._get_inference_input(m0_tensors)
+        with torch.set_grad_enabled(any(p.requires_grad for p in self.m0.parameters())):
             m0_inference_outputs = self.m0.inference(**m0_inference_inputs)
-            m0_generative_inputs = self.m0._get_generative_input(
-                m0_tensors, m0_inference_outputs
-            )
-            m0_generative_outputs = self.m0.generative(**m0_generative_inputs)
-            m0_loss_kwargs = {}
-            for key in (
-                "feed_labels",
-                "kl_weight",
-                "labelled_tensors",
-                "classification_ratio",
-                "replay",
-            ):
-                if key in loss_kwargs:
-                    m0_loss_kwargs[key] = loss_kwargs[key]
-            loss_m0 = self.m0.loss(
-                m0_tensors,
-                m0_inference_outputs,
-                m0_generative_outputs,
-                **m0_loss_kwargs,
-            )
-            loss_m0_value = loss_m0.loss
-            loss_m0_reconstruction = loss_m0.reconstruction_loss
-        energy_score_loss = self.energy_loss(inference_outputs["z"], z_emb, verbose=False)
-        
-        loss = (reconst_loss_emb + energy_score_loss).mean() + loss_m0_value
-        
+
+        adapt_losses = self._adaptation_head_loss(tensors, m0_inference_outputs)
+
+        if not self.use_m0_loss:
+            return adapt_losses
+
+        m0_generative_inputs = self.m0._get_generative_input(
+            m0_tensors, m0_inference_outputs
+        )
+        m0_generative_outputs = self.m0.generative(**m0_generative_inputs)
+        m0_loss_kwargs = {}
+        for key in (
+            "feed_labels",
+            "kl_weight",
+            "labelled_tensors",
+            "classification_ratio",
+            "replay",
+        ):
+            if key in loss_kwargs:
+                m0_loss_kwargs[key] = loss_kwargs[key]
+        loss_m0 = self.m0.loss(
+            m0_tensors,
+            m0_inference_outputs,
+            m0_generative_outputs,
+            **m0_loss_kwargs,
+        )
+        total = adapt_losses.loss + loss_m0.loss
         return LossRecorder(
-            loss=loss, 
-            reconstruction_loss = reconst_loss_emb.mean() + loss_m0_reconstruction, 
-            energy_score_loss=energy_score_loss.mean(),
-            )
+            loss=total,
+            reconstruction_loss=adapt_losses.reconstruction_loss + loss_m0.reconstruction_loss,
+            energy_score_loss=adapt_losses.energy_score_loss,
+        )

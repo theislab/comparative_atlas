@@ -26,9 +26,7 @@ from scvi.data.fields import (
     NumericalObsField,
     ObsmField,
 )
-# from scvi.module import SCANVAE
-# from ._scanvae import SCANVAE
-from ._utils import mask_augment, compute_uncertainty_scores, BI_LSE
+
 
 
 from scvi.dataloaders._ann_dataloader import AnnDataLoader
@@ -117,17 +115,25 @@ class TTA_SCANVI(SCANVI):
     """Adapt a pretrained :class:`SCANVI` model (``m0``) to new data.
 
     ``TTA_SCANVI`` wraps a pretrained reference model and learns to map a
-    precomputed embedding (``embedding_key``) into the reference latent space,
-    decoding it back to new target counts (``x_adapt_key``).
+    precomputed scGPT embedding (``embedding_key``) into the reference latent
+    space, while reconstructing a marker-gene count panel (``x_adapt_key``).
+
+    Two decoders are involved:
+
+    * ``Adapt.decoder`` reconstructs ``x_adapt_key`` from
+      ``projection_layer(embedding)``.
+    * ``m0.decoder`` reconstructs full ``adata.X`` (used in stage 2 replay loss).
 
     The workflow is explicitly split into two function calls:
 
-    1. :meth:`train_stage1_adaptation` trains only adaptation components
-       (projection layer + decoder) on adaptation tensors.
-    2. :meth:`load_query_data_with_replay_stage2` follows SCANVI
-       ``load_query_data_with_replay`` to register/reload query tensors for
-       continual learning, while re-attaching adaptation weights for joint
-       stage-2 training.
+    1. :meth:`train_stage1_adaptation` — frozen ``m0`` encodes gene counts to
+       ``z``; ``projection_layer`` maps embeddings to ``z_proj``; loss =
+       NB reconstruction of ``x_adapt_key`` + energy score between ``z`` and
+       ``z_proj``. Only the adaptation head is trained.
+    2. :meth:`load_query_data_with_replay_stage2` — attaches stage-1 weights,
+       sets up SCANVI replay + EWC on ``m0``, and trains jointly: replay/EWC
+       on ``adata.X`` plus the same adaptation loss on **every** cell (query and
+       replay), using the same minibatch rows.
 
     Parameters
     ----------
@@ -138,36 +144,52 @@ class TTA_SCANVI(SCANVI):
         A trained reference :class:`SCANVI` model to adapt from.
     adapt_kwargs
         Keyword args forwarded to the :class:`Adapt` module, e.g. ``n_input``
-        (number of genes in ``X``), ``n_output`` (dim of ``x_adapt_key``),
-        ``n_latent`` (should match ``m0``'s latent dim), ``n_hidden``,
-        ``n_layers``, ``dropout_rate``.
+        (scGPT embedding dimension), ``n_output`` (number of genes in
+        ``x_adapt_key``), ``n_latent`` (should match ``m0``'s latent dim),
+        ``n_hidden``, ``n_layers``, ``dropout_rate``.
     **kwargs
         Keyword args forwarded to :class:`SCANVI`.
 
     Examples
     --------
-    >>> # m0_model is an already trained SCANVI model
+    >>> # ref_model: trained SCANVI; ad_old: reference cells with obsm keys
+    >>> n_in = ad_old.obsm["X_scgpt"].shape[1]
+    >>> n_out = ad_old.obsm["X_target"].shape[1]
     >>> model = TTA_SCANVI.from_trained_scanvi(
-    ...     m0_model,
-    ...     adapt_kwargs=dict(n_input=2000, n_output=2000, n_latent=m0_model.module.n_latent),
+    ...     ref_model,
+    ...     adapt_kwargs=dict(
+    ...         n_input=n_in,
+    ...         n_output=n_out,
+    ...         n_latent=ref_model.module.n_latent,
+    ...     ),
     ... )
-    >>> # Stage 1: train adaptation only on (embedding, x_m1)
+    >>> # Stage 1: frozen m0 encodes adata.X; train projection + decoder only
     >>> model.train_stage1_adaptation(
-    ...     adata=adata,
-    ...     embedding_key="X_m1_latent",
-    ...     x_adapt_key="X_m1",
+    ...     adata=ad_old,
+    ...     embedding_key="X_scgpt",
+    ...     x_adapt_key="X_target",
     ...     max_epochs=50,
+    ...     batch_size=128,
     ... )
-    >>> # Stage 2: reload/query with replay (SCANVI path) and keep adaptation attached
+    >>> # Stage 2: all cells need obsm["X_scgpt"] and obsm["X_target"]
+    >>> adata_query = adata_query.concatenate(adata_replay)
+    >>> adata_query.uns["ctrl_query"] = ctrl_adata
+    >>> adata_query.uns["replay_adata"] = adata_replay
     >>> model_stage2 = TTA_SCANVI.load_query_data_with_replay_stage2(
     ...     adata=adata_query,
-    ...     reference_model=model,
-    ...     control_uns_key="control_adata",
+    ...     reference_model=ref_model,
+    ...     control_uns_key="ctrl_query",
     ...     replay_uns_key="replay_adata",
+    ...     adapt_reference_model=model,
+    ...     embedding_key="X_scgpt",
+    ...     x_adapt_key="X_target",
     ... )
-    >>> model_stage2.train(max_epochs=200, plan_kwargs=dict(ewc_importance=1.0))
-    >>> adata.obsm["X_adapt"] = model.get_latent_representation()
-    >>> adata.obs["pred_label"] = model.predict()
+    >>> model_stage2.train(
+    ...     max_epochs=200,
+    ...     batch_size=128,
+    ...     plan_kwargs=dict(ewc_importance=1.2),
+    ... )
+    >>> adata_query.obsm["X_TTA_SCANVI"] = model_stage2.get_latent_representation()
     """
 
     def __init__(
@@ -231,10 +253,45 @@ class TTA_SCANVI(SCANVI):
         """Stage 1: train adaptation only (projection + decoder).
 
         This stage runs a direct minibatch torch loop (without Lightning
-        TrainRunner) to avoid SCANVI replay manager assumptions. It optimizes
-        the adaptation objective on tensors from ``adata.obsm``:
-        ``embedding_key`` (encoder input) and ``x_adapt_key`` (reconstruction
-        target), while keeping ``m0`` frozen and EWC disabled.
+        TrainRunner). For each cell:
+
+        * gene counts ``X`` are encoded by **frozen** ``m0.z_encoder`` → ``z``
+        * scgpt embeddings are mapped by ``projection_layer`` → ``z_emb``
+        * loss = NB reconstruction of ``x_adapt_key`` from ``z_emb`` + energy
+          score between ``z`` and ``z_emb``
+
+        ``Adapt.z_encoder`` is not used. Only ``projection_layer``,
+        ``decoder``, and ``px_r_m0`` are trained; ``m0`` stays frozen.
+
+        Parameters
+        ----------
+        adata
+            AnnData with SCANVI-registered ``adata.X`` (gene counts) and
+            ``adata.obsm[embedding_key]``, ``adata.obsm[x_adapt_key]``.
+        embedding_key
+            ``obsm`` key for scGPT embeddings (encoder input to
+            ``projection_layer``).
+        x_adapt_key
+            ``obsm`` key for marker-gene counts reconstructed by
+            ``Adapt.decoder``.
+        max_epochs
+            Number of training epochs (default 50).
+        batch_size
+            Minibatch size for the manual training loop (default 128).
+        train_size
+            Fraction of cells used for training (default 0.9).
+        plan_kwargs
+            Optional dict with ``lr`` and ``weight_decay`` for Adam.
+
+        Examples
+        --------
+        >>> model.train_stage1_adaptation(
+        ...     adata=ad_old,
+        ...     embedding_key="X_scgpt",
+        ...     x_adapt_key="X_target",
+        ...     max_epochs=50,
+        ...     batch_size=128,
+        ... )
         """
         adata = self._validate_anndata(adata)
         adata_manager = self.get_anndata_manager(adata, required=True)
@@ -259,6 +316,9 @@ class TTA_SCANVI(SCANVI):
             raise ValueError(
                 "`x_adapt_key` contains negative values; NB reconstruction expects non-negative counts/intensities."
             )
+
+        # Gene counts for the frozen m0 encoder (SCANVI-registered X).
+        x_m0_data = adata_manager.get_from_registry(REGISTRY_KEYS.X_KEY)
 
         # Optional covariates/labels from SCANVI registry.
         batch_data = adata_manager.get_from_registry(REGISTRY_KEYS.BATCH_KEY)
@@ -290,6 +350,11 @@ class TTA_SCANVI(SCANVI):
         # Stage-1 settings.
         for p in self.module.m0.parameters():
             p.requires_grad_(False)
+        # Adapt inherits a VAE z_encoder from SCANVAE but it is not part of the
+        # adaptation design; keep it frozen so only projection/decoder train.
+        for name, p in self.module.named_parameters():
+            if name.startswith("z_encoder.") or name.startswith("l_encoder."):
+                p.requires_grad_(False)
         self.module.use_m0_loss = False
         self.module.use_embedding_for_inference = True
         self.module.to(device)
@@ -319,6 +384,10 @@ class TTA_SCANVI(SCANVI):
             n_batches = 0
             for i in range(0, len(perm), batch_size):
                 idx = perm[i : i + batch_size]
+                x_slice = _slice_rows(x_m0_data, idx)
+                if sp.issparse(x_slice):
+                    x_slice = x_slice.toarray()
+                x = torch.as_tensor(x_slice, dtype=torch.float32, device=device)
                 emb = torch.as_tensor(embedding_data[idx], dtype=torch.float32, device=device)
                 x_m1 = torch.as_tensor(x_m1_data[idx], dtype=torch.float32, device=device)
                 batch = torch.as_tensor(
@@ -326,7 +395,7 @@ class TTA_SCANVI(SCANVI):
                 )
 
                 tensors = {
-                    REGISTRY_KEYS.X_KEY: emb,
+                    REGISTRY_KEYS.X_KEY: x,
                     REGISTRY_KEYS.BATCH_KEY: batch,
                     "embedding": emb,
                     "x_m1": x_m1,
@@ -349,17 +418,12 @@ class TTA_SCANVI(SCANVI):
                     )
 
                 optimizer.zero_grad()
-                inference_inputs = self.module._get_inference_input(tensors)
-                inference_outputs = self.module.inference(**inference_inputs)
-                # Stage-1 objective (use_m0_loss=False) only depends on
-                # inference outputs + adaptation tensors; avoid VAE generative
-                # path, which injects SCANVI categorical inputs incompatible
-                # with the custom Adapt decoder signature.
-                losses = self.module.loss(
-                    tensors,
-                    inference_outputs,
-                    generative_outputs={},
-                )
+                with torch.no_grad():
+                    m0_inference_inputs = self.module.m0._get_inference_input(tensors)
+                    m0_inference_outputs = self.module.m0.inference(
+                        **m0_inference_inputs
+                    )
+                losses = self.module._adaptation_head_loss(tensors, m0_inference_outputs)
                 loss = losses.loss if losses.loss.ndim == 0 else losses.loss.mean()
                 if not torch.isfinite(loss):
                     raise RuntimeError(
@@ -390,12 +454,65 @@ class TTA_SCANVI(SCANVI):
         control_uns_key: str = None,
         replay_uns_key: str = None,
         adapt_reference_model: Optional["TTA_SCANVI"] = None,
+        embedding_key: str = "X_scgpt",
+        x_adapt_key: str = "X_target",
         **kwargs,
     ):
         """Stage 2: SCANVI replay loading + adaptation module reattachment.
 
         This follows :meth:`SCANVI.load_query_data_with_replay` for registry and
         continual-learning setup, then attaches the adaptation module/weights.
+
+        The stage-2 objective on **every cell** (query and replay) is:
+
+        * NB reconstruction of ``x_adapt_key`` from the scgpt embedding via the
+          adaptation head, plus an energy score aligning ``projection_layer(z)``
+          to ``m0``'s gene-count latent ``z``, and
+        * the standard SCANVI replay loss plus EWC on gene counts via ``m0``.
+
+        Both terms are evaluated on the same minibatch rows, so the model learns
+        to align the embedding and gene-count representations jointly.
+
+        Parameters
+        ----------
+        adata
+            Query (+ replay concatenated) AnnData with SCANVI-registered
+            ``adata.X`` and ``obsm[embedding_key]`` / ``obsm[x_adapt_key]`` on
+            **every** row.
+        reference_model
+            Trained reference :class:`SCANVI` (path or model object).
+        control_uns_key, replay_uns_key
+            ``adata.uns`` keys for control and replay subsets (see
+            :meth:`SCANVI.load_query_data_with_replay`).
+        adapt_reference_model
+            Stage-1 :class:`TTA_SCANVI` whose adaptation weights are copied
+            and attached. Pass the object returned from stage 1.
+        embedding_key, x_adapt_key
+            ``obsm`` keys for scGPT embeddings and marker-gene targets.
+
+        Examples
+        --------
+        >>> adata_query.obsm["X_scgpt"] = emb_pilot.X
+        >>> adata_query.obsm["X_target"] = target_counts
+        >>> adata_replay.obsm["X_scgpt"] = emb_atlas[adata_replay.obs_names].X
+        >>> adata_replay.obsm["X_target"] = target_counts_replay
+        >>> adata_train = adata_query.concatenate(adata_replay)
+        >>> adata_train.uns["ctrl_query"] = ctrl_adata
+        >>> adata_train.uns["replay_adata"] = adata_replay
+        >>> model_stage2 = TTA_SCANVI.load_query_data_with_replay_stage2(
+        ...     adata=adata_train,
+        ...     reference_model=ref_model,
+        ...     control_uns_key="ctrl_query",
+        ...     replay_uns_key="replay_adata",
+        ...     adapt_reference_model=model,
+        ...     embedding_key="X_scgpt",
+        ...     x_adapt_key="X_target",
+        ... )
+        >>> model_stage2.train(
+        ...     max_epochs=200,
+        ...     batch_size=128,
+        ...     plan_kwargs=dict(ewc_importance=1.2),
+        ... )
         """
         model = SCANVI.load_query_data_with_replay(
             adata=adata,
@@ -422,10 +539,42 @@ class TTA_SCANVI(SCANVI):
 
             # Rewire reference module pointers to stage-2 continual model.
             adapted_module.m0 = stage2_base_module
-            if hasattr(stage2_base_module, "px_r"):
-                adapted_module.px_r_m0 = stage2_base_module.px_r
-            adapted_module.use_m0_loss = True
+            # Keep stage-1 ``px_r_m0`` (size = n_output / X_target genes). Do not
+            # replace with ``m0.px_r`` (full adata.X gene dimension).
+            adapted_module.use_m0_loss = False
             adapted_module.use_embedding_for_inference = False
+
+            registered_adata = model.adata
+            if embedding_key not in registered_adata.obsm:
+                raise KeyError(
+                    f"Stage-2 requires obsm['{embedding_key}'] on all training cells."
+                )
+            if x_adapt_key not in registered_adata.obsm:
+                raise KeyError(
+                    f"Stage-2 requires obsm['{x_adapt_key}'] on all training cells."
+                )
+
+            # Register adaptation obsm fields so every gene-count minibatch also
+            # carries the scgpt embedding and reconstruction target tensors.
+            adata_manager = model.get_anndata_manager(registered_adata, required=True)
+            for field in (
+                ObsmField("embedding", embedding_key, is_count_data=False),
+                ObsmField("x_m1", x_adapt_key, is_count_data=True),
+            ):
+                if field.registry_key not in adata_manager.data_registry:
+                    adata_manager._add_field(field, registered_adata)
+
+            emb_data = registered_adata.obsm[embedding_key]
+            if sp.issparse(emb_data):
+                emb_data = emb_data.toarray()
+            x_m1_data = registered_adata.obsm[x_adapt_key]
+            if sp.issparse(x_m1_data):
+                x_m1_data = x_m1_data.toarray()
+            adapted_module.set_stage2_adaptation_tensors(
+                embedding=np.asarray(emb_data, dtype=np.float32),
+                x_m1=np.asarray(x_m1_data, dtype=np.float32),
+            )
+
             model.module = adapted_module
         return model
 
