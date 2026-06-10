@@ -134,6 +134,10 @@ class TTA_SCANVI(SCANVI):
        sets up SCANVI replay + EWC on ``m0``, and trains jointly: replay/EWC
        on ``adata.X`` plus the same adaptation loss on **every** cell (query and
        replay), using the same minibatch rows.
+    3. :meth:`train_test_time_adaptation` — on a stage-2 model, fine-tune on new
+       query cells using **only** the adaptation-head loss (NB + energy alignment).
+       Both ``m0`` and the auxiliary head receive gradients from that objective; no
+       SCANVI replay or EWC terms are included.
 
     Parameters
     ----------
@@ -189,6 +193,14 @@ class TTA_SCANVI(SCANVI):
     ...     batch_size=128,
     ...     plan_kwargs=dict(ewc_importance=1.2),
     ... )
+    >>> # Test-time: adapt auxiliary head only on held-out query cells
+    >>> model_stage2.train_test_time_adaptation(
+    ...     adata=adata_test,
+    ...     embedding_key="X_scgpt",
+    ...     x_adapt_key="X_target",
+    ...     max_epochs=20,
+    ...     batch_size=128,
+    ... )
     >>> adata_query.obsm["X_TTA_SCANVI"] = model_stage2.get_latent_representation()
     """
 
@@ -234,6 +246,23 @@ class TTA_SCANVI(SCANVI):
         adapt_kwargs = adapt_kwargs or {}
         model.module = Adapt(m0_module=deepcopy(reference_model.module), **adapt_kwargs)
         model.was_pretrained = True
+        return model
+
+    @classmethod
+    def promote_from_stage2(cls, model: SCANVI) -> "TTA_SCANVI":
+        """Promote a stage-2 continual model to :class:`TTA_SCANVI`.
+
+        Use this when ``load_query_data_with_replay_stage2`` was run with an
+        older code path that returned a plain :class:`SCANVI` instance, or when
+        a saved stage-2 checkpoint was loaded via :class:`SCANVI`.
+        """
+        if not isinstance(model.module, Adapt):
+            raise TypeError(
+                "promote_from_stage2 expects an Adapt module on `model.module`."
+            )
+        model.__class__ = cls
+        if not hasattr(model, "m0_model"):
+            model.m0_model = model.module.m0
         return model
 
     def train_stage1_adaptation(
@@ -446,6 +475,245 @@ class TTA_SCANVI(SCANVI):
         self.history_ = {"stage1_train_loss": epoch_losses}
         return self.history_
 
+    def train_test_time_adaptation(
+        self,
+        adata: AnnData,
+        embedding_key: str,
+        x_adapt_key: str,
+        max_epochs: Optional[int] = None,
+        batch_size: int = 128,
+        train_size: float = 1.0,
+        use_gpu: Optional[Union[str, int, bool]] = None,
+        plan_kwargs: Optional[dict] = None,
+        **kwargs,
+    ):
+        """Test-time adaptation on new query data via the auxiliary objective.
+
+        Intended for a **stage-2** :class:`TTA_SCANVI` model. All parameters in
+        ``m0`` and the adaptation head (``projection_layer``, ``decoder``,
+        ``px_r_m0``) are trainable. The **only** loss is the stage-2
+        adaptation-head objective
+        (:meth:`Adapt._adaptation_head_loss`):
+
+        * NB reconstruction of ``x_adapt_key`` from ``projection_layer(embedding)``
+        * energy score aligning ``m0.z`` (from gene counts) to
+          ``projection_layer(embedding)``
+
+        Gradients therefore update ``m0`` through the alignment term and the
+        auxiliary head through both terms. Unused :class:`Adapt` encoders
+        (``z_encoder``, ``l_encoder``) stay frozen. No SCANVI ELBO, replay, or
+        EWC loss is applied—this is test-time adaptation through the auxiliary
+        pathway only.
+
+        After adaptation, :meth:`get_latent_representation` reflects the updated
+        ``m0`` encoder on gene counts.
+
+        Parameters
+        ----------
+        adata
+            Query AnnData with SCANVI-registered ``adata.X`` and
+            ``obsm[embedding_key]``, ``obsm[x_adapt_key]``.
+        embedding_key
+            ``obsm`` key for scGPT embeddings.
+        x_adapt_key
+            ``obsm`` key for marker-gene reconstruction targets.
+        max_epochs
+            Number of fine-tuning epochs (default 20).
+        batch_size
+            Minibatch size (default 128).
+        train_size
+            Fraction of cells used for adaptation (default 1.0).
+        plan_kwargs
+            Optional dict with ``lr``, ``weight_decay``, and optional ``m0_lr``
+            (learning rate for ``m0``; defaults to ``lr``).
+
+        Examples
+        --------
+        >>> model_stage2.train_test_time_adaptation(
+        ...     adata=adata_test,
+        ...     embedding_key="X_scgpt",
+        ...     x_adapt_key="X_target",
+        ...     max_epochs=20,
+        ...     batch_size=128,
+        ... )
+        """
+        if not isinstance(self.module, Adapt):
+            raise TypeError(
+                "train_test_time_adaptation expects a TTA_SCANVI model with an "
+                "Adapt module (typically after stage 2)."
+            )
+
+        adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata, required=True)
+
+        if use_gpu is False:
+            device = torch.device("cpu")
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        embedding_data = adata.obsm[embedding_key]
+        if sp.issparse(embedding_data):
+            embedding_data = embedding_data.toarray()
+        x_m1_data = adata.obsm[x_adapt_key]
+        if sp.issparse(x_m1_data):
+            x_m1_data = x_m1_data.toarray()
+        x_m1_data = np.asarray(x_m1_data, dtype=np.float32)
+        if not np.isfinite(x_m1_data).all():
+            raise ValueError("`x_adapt_key` contains non-finite values (NaN/Inf).")
+        if (x_m1_data < 0).any():
+            raise ValueError(
+                "`x_adapt_key` contains negative values; NB reconstruction expects "
+                "non-negative counts/intensities."
+            )
+
+        x_m0_data = adata_manager.get_from_registry(REGISTRY_KEYS.X_KEY)
+        batch_data = adata_manager.get_from_registry(REGISTRY_KEYS.BATCH_KEY)
+        labels_data = (
+            adata_manager.get_from_registry(REGISTRY_KEYS.LABELS_KEY)
+            if REGISTRY_KEYS.LABELS_KEY in adata_manager.data_registry
+            else None
+        )
+        cont_covs_data = (
+            adata_manager.get_from_registry(REGISTRY_KEYS.CONT_COVS_KEY)
+            if REGISTRY_KEYS.CONT_COVS_KEY in adata_manager.data_registry
+            else None
+        )
+        cat_covs_data = (
+            adata_manager.get_from_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+            if REGISTRY_KEYS.CAT_COVS_KEY in adata_manager.data_registry
+            else None
+        )
+
+        def _slice_rows(data, idx):
+            if data is None:
+                return None
+            if isinstance(data, pd.DataFrame):
+                return data.iloc[idx, :].to_numpy()
+            if isinstance(data, pd.Series):
+                return data.iloc[idx].to_numpy()
+            return data[idx]
+
+        prev_use_embedding_for_inference = self.module.use_embedding_for_inference
+        for p in self.module.m0.parameters():
+            p.requires_grad_(True)
+        for name, p in self.module.named_parameters():
+            if name.startswith("z_encoder.") or name.startswith("l_encoder."):
+                p.requires_grad_(False)
+        self.module.use_m0_loss = False
+        self.module.to(device)
+        self.module.train()
+
+        plan_kwargs = dict(plan_kwargs or {})
+        lr = float(plan_kwargs.get("lr", 1e-3))
+        m0_lr = float(plan_kwargs.get("m0_lr", lr))
+        weight_decay = float(plan_kwargs.get("weight_decay", 1e-6))
+        adapt_params = [
+            p
+            for name, p in self.module.named_parameters()
+            if p.requires_grad and not name.startswith("m0.")
+        ]
+        m0_params = [p for p in self.module.m0.parameters() if p.requires_grad]
+        if not adapt_params and not m0_params:
+            raise RuntimeError(
+                "No trainable parameters found for test-time adaptation."
+            )
+        param_groups = []
+        if adapt_params:
+            param_groups.append(
+                {"params": adapt_params, "lr": lr, "weight_decay": weight_decay}
+            )
+        if m0_params:
+            param_groups.append(
+                {"params": m0_params, "lr": m0_lr, "weight_decay": weight_decay}
+            )
+        optimizer = torch.optim.Adam(param_groups, eps=0.01)
+
+        n_obs = adata.n_obs
+        if max_epochs is None:
+            max_epochs = 20
+        train_n = int(np.floor(train_size * n_obs))
+        all_idx = np.arange(n_obs)
+        np.random.shuffle(all_idx)
+        train_idx = all_idx[:train_n]
+        if len(train_idx) == 0:
+            raise ValueError(
+                "Test-time adaptation train split is empty; increase `train_size`."
+            )
+
+        epoch_losses = []
+        for _ in range(max_epochs):
+            perm = np.random.permutation(train_idx)
+            running = 0.0
+            n_batches = 0
+            for i in range(0, len(perm), batch_size):
+                idx = perm[i : i + batch_size]
+                x_slice = _slice_rows(x_m0_data, idx)
+                if sp.issparse(x_slice):
+                    x_slice = x_slice.toarray()
+                x = torch.as_tensor(x_slice, dtype=torch.float32, device=device)
+                emb = torch.as_tensor(embedding_data[idx], dtype=torch.float32, device=device)
+                x_m1 = torch.as_tensor(x_m1_data[idx], dtype=torch.float32, device=device)
+                batch = torch.as_tensor(
+                    _slice_rows(batch_data, idx), dtype=torch.int64, device=device
+                )
+
+                tensors = {
+                    REGISTRY_KEYS.X_KEY: x,
+                    REGISTRY_KEYS.BATCH_KEY: batch,
+                    "embedding": emb,
+                    "x_m1": x_m1,
+                }
+                if labels_data is not None:
+                    tensors[REGISTRY_KEYS.LABELS_KEY] = torch.as_tensor(
+                        _slice_rows(labels_data, idx), dtype=torch.int64, device=device
+                    )
+                if cont_covs_data is not None:
+                    tensors[REGISTRY_KEYS.CONT_COVS_KEY] = torch.as_tensor(
+                        _slice_rows(cont_covs_data, idx),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                if cat_covs_data is not None:
+                    tensors[REGISTRY_KEYS.CAT_COVS_KEY] = torch.as_tensor(
+                        _slice_rows(cat_covs_data, idx),
+                        dtype=torch.int64,
+                        device=device,
+                    )
+
+                optimizer.zero_grad()
+                m0_inference_inputs = self.module.m0._get_inference_input(tensors)
+                with torch.set_grad_enabled(
+                    any(p.requires_grad for p in self.module.m0.parameters())
+                ):
+                    m0_inference_outputs = self.module.m0.inference(
+                        **m0_inference_inputs
+                    )
+                losses = self.module._adaptation_head_loss(tensors, m0_inference_outputs)
+                loss = losses.loss if losses.loss.ndim == 0 else losses.loss.mean()
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        "Non-finite test-time adaptation loss encountered. "
+                        f"batch_start={i}, "
+                        f"emb_finite={torch.isfinite(emb).all().item()}, "
+                        f"x_m1_finite={torch.isfinite(x_m1).all().item()}"
+                    )
+                loss.backward()
+                optimizer.step()
+                running += float(loss.detach().cpu())
+                n_batches += 1
+
+            epoch_losses.append(running / max(n_batches, 1))
+
+        self.module.use_embedding_for_inference = prev_use_embedding_for_inference
+        self.module.eval()
+        self.is_trained_ = True
+        history = {"test_time_adaptation_train_loss": epoch_losses}
+        if self.history_ is None:
+            self.history_ = history
+        else:
+            self.history_.update(history)
+        return history
+
     @classmethod
     def load_query_data_with_replay_stage2(
         cls,
@@ -521,6 +789,11 @@ class TTA_SCANVI(SCANVI):
             replay_uns_key=replay_uns_key,
             **kwargs,
         )
+        ref_for_m0 = (
+            reference_model
+            if isinstance(reference_model, SCANVI)
+            else getattr(model, "m0_model", None)
+        )
         if adapt_reference_model is None and isinstance(reference_model, TTA_SCANVI):
             adapt_reference_model = reference_model
         if adapt_reference_model is not None:
@@ -576,6 +849,14 @@ class TTA_SCANVI(SCANVI):
             )
 
             model.module = adapted_module
+
+            # Promote the continual-learning SCANVI wrapper to TTA_SCANVI so
+            # stage-1 / test-time methods are available on the returned object.
+            model.__class__ = cls
+            if hasattr(adapt_reference_model, "m0_model"):
+                model.m0_model = adapt_reference_model.m0_model
+            elif ref_for_m0 is not None:
+                model.m0_model = ref_for_m0
         return model
 
     def register_ewc_anchor(
