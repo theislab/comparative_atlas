@@ -248,6 +248,28 @@ class TTA_SCANVI(SCANVI):
         model.was_pretrained = True
         return model
 
+    @staticmethod
+    def _init_adapt_epoch_running():
+        return {
+            "train_loss": 0.0,
+            "adapt_reconstruction_loss": 0.0,
+            "energy_score_loss": 0.0,
+        }
+
+    @staticmethod
+    def _update_adapt_epoch_running(running, losses):
+        total = losses.loss if losses.loss.ndim == 0 else losses.loss.mean()
+        running["train_loss"] += float(total.detach().cpu())
+        running["adapt_reconstruction_loss"] += float(
+            losses.reconstruction_loss.detach().cpu()
+        )
+        running["energy_score_loss"] += float(losses.energy_score_loss.detach().cpu())
+
+    @staticmethod
+    def _finalize_adapt_epoch_running(running, n_batches):
+        denom = max(n_batches, 1)
+        return {key: value / denom for key, value in running.items()}
+
     @classmethod
     def promote_from_stage2(cls, model: SCANVI) -> "TTA_SCANVI":
         """Promote a stage-2 continual model to :class:`TTA_SCANVI`.
@@ -406,10 +428,10 @@ class TTA_SCANVI(SCANVI):
         if len(train_idx) == 0:
             raise ValueError("Stage-1 train split is empty; increase `train_size`.")
 
-        epoch_losses = []
+        epoch_hist = {key: [] for key in self._init_adapt_epoch_running()}
         for _ in range(max_epochs):
             perm = np.random.permutation(train_idx)
-            running = 0.0
+            running = self._init_adapt_epoch_running()
             n_batches = 0
             for i in range(0, len(perm), batch_size):
                 idx = perm[i : i + batch_size]
@@ -465,14 +487,16 @@ class TTA_SCANVI(SCANVI):
                     )
                 loss.backward()
                 optimizer.step()
-                running += float(loss.detach().cpu())
+                self._update_adapt_epoch_running(running, losses)
                 n_batches += 1
 
-            epoch_losses.append(running / max(n_batches, 1))
+            finalized = self._finalize_adapt_epoch_running(running, n_batches)
+            for key, value in finalized.items():
+                epoch_hist[key].append(value)
 
         self.module.eval()
         self.is_trained_ = True
-        self.history_ = {"stage1_train_loss": epoch_losses}
+        self.history_ = {"stage1": epoch_hist}
         return self.history_
 
     def train_test_time_adaptation(
@@ -640,10 +664,10 @@ class TTA_SCANVI(SCANVI):
                 "Test-time adaptation train split is empty; increase `train_size`."
             )
 
-        epoch_losses = []
+        epoch_hist = {key: [] for key in self._init_adapt_epoch_running()}
         for _ in range(max_epochs):
             perm = np.random.permutation(train_idx)
-            running = 0.0
+            running = self._init_adapt_epoch_running()
             n_batches = 0
             for i in range(0, len(perm), batch_size):
                 idx = perm[i : i + batch_size]
@@ -699,15 +723,17 @@ class TTA_SCANVI(SCANVI):
                     )
                 loss.backward()
                 optimizer.step()
-                running += float(loss.detach().cpu())
+                self._update_adapt_epoch_running(running, losses)
                 n_batches += 1
 
-            epoch_losses.append(running / max(n_batches, 1))
+            finalized = self._finalize_adapt_epoch_running(running, n_batches)
+            for key, value in finalized.items():
+                epoch_hist[key].append(value)
 
         self.module.use_embedding_for_inference = prev_use_embedding_for_inference
         self.module.eval()
         self.is_trained_ = True
-        history = {"test_time_adaptation_train_loss": epoch_losses}
+        history = {"stage3": epoch_hist}
         if self.history_ is None:
             self.history_ = history
         else:
