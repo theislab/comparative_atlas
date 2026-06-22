@@ -135,9 +135,10 @@ class TTA_SCANVI(SCANVI):
        on ``adata.X`` plus the same adaptation loss on **every** cell (query and
        replay), using the same minibatch rows.
     3. :meth:`train_test_time_adaptation` — on a stage-2 model, fine-tune on new
-       query cells using **only** the adaptation-head loss (NB + energy alignment).
-       Both ``m0`` and the auxiliary head receive gradients from that objective; no
-       SCANVI replay or EWC terms are included.
+       query cells with :math:`L = \\mathrm{NB}(X_{target}) + w \\cdot
+       \\mathrm{energy}(z_{m0}, z_{proj})`. Both ``m0`` (via the energy term)
+       and the auxiliary head are updated; ``m0`` SCANVI reconstruction and EWC
+       are logged for monitoring only.
 
     Parameters
     ----------
@@ -249,6 +250,12 @@ class TTA_SCANVI(SCANVI):
         return model
 
     @staticmethod
+    def _apply_plan_alignment_weight(module, plan_kwargs):
+        plan_kwargs = dict(plan_kwargs or {})
+        if "alignment_loss_weight" in plan_kwargs:
+            module.alignment_loss_weight = float(plan_kwargs["alignment_loss_weight"])
+
+    @staticmethod
     def _init_adapt_epoch_running():
         return {
             "train_loss": 0.0,
@@ -269,6 +276,35 @@ class TTA_SCANVI(SCANVI):
     def _finalize_adapt_epoch_running(running, n_batches):
         denom = max(n_batches, 1)
         return {key: value / denom for key, value in running.items()}
+
+    @staticmethod
+    def _init_stage3_epoch_running():
+        return {
+            "train_loss": 0.0,
+            "adapt_reconstruction_loss": 0.0,
+            "energy_score_loss": 0.0,
+            "m0_reconstruction_loss": 0.0,
+            "ewc_loss": 0.0,
+        }
+
+    @staticmethod
+    def _update_stage3_epoch_running(running, adapt_losses, log_metrics):
+        def _to_float(value):
+            if isinstance(value, torch.Tensor):
+                if value.ndim > 0:
+                    value = value.mean()
+                return float(value.detach().cpu())
+            return float(value)
+
+        running["train_loss"] += _to_float(
+            adapt_losses.loss if adapt_losses.loss.ndim == 0 else adapt_losses.loss.mean()
+        )
+        running["adapt_reconstruction_loss"] += _to_float(
+            adapt_losses.reconstruction_loss
+        )
+        running["energy_score_loss"] += _to_float(adapt_losses.energy_score_loss)
+        running["m0_reconstruction_loss"] += float(log_metrics["m0_reconstruction_loss"])
+        running["ewc_loss"] += float(log_metrics["ewc_loss"])
 
     @classmethod
     def promote_from_stage2(cls, model: SCANVI) -> "TTA_SCANVI":
@@ -332,7 +368,10 @@ class TTA_SCANVI(SCANVI):
         train_size
             Fraction of cells used for training (default 0.9).
         plan_kwargs
-            Optional dict with ``lr`` and ``weight_decay`` for Adam.
+            Optional dict with ``lr``, ``weight_decay``,
+            ``alignment_loss_weight`` (scales energy alignment vs NB recon), and
+            ``alignment_warmup_epochs`` (train on energy alignment only for the
+            first N epochs before adding NB reconstruction).
 
         Examples
         --------
@@ -413,6 +452,8 @@ class TTA_SCANVI(SCANVI):
 
         # Keep optimizer configurable via plan_kwargs to match existing API style.
         plan_kwargs = dict(plan_kwargs or {})
+        self._apply_plan_alignment_weight(self.module, plan_kwargs)
+        alignment_warmup_epochs = int(plan_kwargs.get("alignment_warmup_epochs", 0))
         lr = float(plan_kwargs.get("lr", 1e-3))
         weight_decay = float(plan_kwargs.get("weight_decay", 1e-6))
         params = [p for p in self.module.parameters() if p.requires_grad]
@@ -429,7 +470,10 @@ class TTA_SCANVI(SCANVI):
             raise ValueError("Stage-1 train split is empty; increase `train_size`.")
 
         epoch_hist = {key: [] for key in self._init_adapt_epoch_running()}
-        for _ in range(max_epochs):
+        for epoch_idx in range(max_epochs):
+            alignment_only = (
+                alignment_warmup_epochs > 0 and epoch_idx < alignment_warmup_epochs
+            )
             perm = np.random.permutation(train_idx)
             running = self._init_adapt_epoch_running()
             n_batches = 0
@@ -474,7 +518,9 @@ class TTA_SCANVI(SCANVI):
                     m0_inference_outputs = self.module.m0.inference(
                         **m0_inference_inputs
                     )
-                losses = self.module._adaptation_head_loss(tensors, m0_inference_outputs)
+                losses = self.module._adaptation_head_loss(
+                    tensors, m0_inference_outputs, alignment_only=alignment_only
+                )
                 loss = losses.loss if losses.loss.ndim == 0 else losses.loss.mean()
                 if not torch.isfinite(loss):
                     raise RuntimeError(
@@ -511,26 +557,28 @@ class TTA_SCANVI(SCANVI):
         plan_kwargs: Optional[dict] = None,
         **kwargs,
     ):
-        """Test-time adaptation on new query data via the auxiliary objective.
+        """Test-time adaptation on new query data.
 
-        Intended for a **stage-2** :class:`TTA_SCANVI` model. All parameters in
-        ``m0`` and the adaptation head (``projection_layer``, ``decoder``,
-        ``px_r_m0``) are trainable. The **only** loss is the stage-2
-        adaptation-head objective
+        Intended for a **stage-2** :class:`TTA_SCANVI` model. The **optimization**
+        objective is the adaptation-head loss only
         (:meth:`Adapt._adaptation_head_loss`):
 
-        * NB reconstruction of ``x_adapt_key`` from ``projection_layer(embedding)``
-        * energy score aligning ``m0.z`` (from gene counts) to
-          ``projection_layer(embedding)``
+        .. math::
 
-        Gradients therefore update ``m0`` through the alignment term and the
-        auxiliary head through both terms. Unused :class:`Adapt` encoders
-        (``z_encoder``, ``l_encoder``) stay frozen. No SCANVI ELBO, replay, or
-        EWC loss is applied—this is test-time adaptation through the auxiliary
-        pathway only.
+            L_{train} = \\mathrm{NB}(X_{target})
+            + \\texttt{alignment\\_loss\\_weight} \\times
+            \\mathrm{energy}(z_{m0}, z_{proj})
 
-        After adaptation, :meth:`get_latent_representation` reflects the updated
-        ``m0`` encoder on gene counts.
+        * ``m0`` (SCANVI backbone) and the auxiliary head
+          (``projection_layer``, ``decoder``, ``px_r_m0``) are trainable.
+        * ``m0`` receives gradients through the **energy alignment** term
+          (``z_m0`` from gene counts ``adata.X``).
+        * The auxiliary head receives gradients from NB reconstruction and
+          energy alignment.
+
+        ``m0`` SCANVI reconstruction and the raw EWC penalty are computed each
+        batch and written to the stage-3 history for monitoring, but are **not**
+        added to ``L_{train}``.
 
         Parameters
         ----------
@@ -548,8 +596,9 @@ class TTA_SCANVI(SCANVI):
         train_size
             Fraction of cells used for adaptation (default 1.0).
         plan_kwargs
-            Optional dict with ``lr``, ``weight_decay``, and optional ``m0_lr``
-            (learning rate for ``m0``; defaults to ``lr``).
+            Optional dict with ``lr``, ``weight_decay``, optional ``m0_lr``,
+            ``alignment_loss_weight``, and ``ewc_importance`` (the latter is
+            used only when computing logged EWC values).
 
         Examples
         --------
@@ -628,6 +677,9 @@ class TTA_SCANVI(SCANVI):
         self.module.train()
 
         plan_kwargs = dict(plan_kwargs or {})
+        self._apply_plan_alignment_weight(self.module, plan_kwargs)
+        ewc_importance = float(plan_kwargs.get("ewc_importance", 0.0))
+        loss_kwargs = {"ewc_importance": ewc_importance, "feed_labels": False}
         lr = float(plan_kwargs.get("lr", 1e-3))
         m0_lr = float(plan_kwargs.get("m0_lr", lr))
         weight_decay = float(plan_kwargs.get("weight_decay", 1e-6))
@@ -664,10 +716,10 @@ class TTA_SCANVI(SCANVI):
                 "Test-time adaptation train split is empty; increase `train_size`."
             )
 
-        epoch_hist = {key: [] for key in self._init_adapt_epoch_running()}
+        epoch_hist = {key: [] for key in self._init_stage3_epoch_running()}
         for _ in range(max_epochs):
             perm = np.random.permutation(train_idx)
-            running = self._init_adapt_epoch_running()
+            running = self._init_stage3_epoch_running()
             n_batches = 0
             for i in range(0, len(perm), batch_size):
                 idx = perm[i : i + batch_size]
@@ -712,8 +764,17 @@ class TTA_SCANVI(SCANVI):
                     m0_inference_outputs = self.module.m0.inference(
                         **m0_inference_inputs
                     )
-                losses = self.module._adaptation_head_loss(tensors, m0_inference_outputs)
-                loss = losses.loss if losses.loss.ndim == 0 else losses.loss.mean()
+                adapt_losses = self.module._adaptation_head_loss(
+                    tensors, m0_inference_outputs
+                )
+                log_metrics = self.module._compute_stage3_log_metrics(
+                    tensors, m0_inference_outputs, loss_kwargs
+                )
+                loss = (
+                    adapt_losses.loss
+                    if adapt_losses.loss.ndim == 0
+                    else adapt_losses.loss.mean()
+                )
                 if not torch.isfinite(loss):
                     raise RuntimeError(
                         "Non-finite test-time adaptation loss encountered. "
@@ -723,7 +784,7 @@ class TTA_SCANVI(SCANVI):
                     )
                 loss.backward()
                 optimizer.step()
-                self._update_adapt_epoch_running(running, losses)
+                self._update_stage3_epoch_running(running, adapt_losses, log_metrics)
                 n_batches += 1
 
             finalized = self._finalize_adapt_epoch_running(running, n_batches)

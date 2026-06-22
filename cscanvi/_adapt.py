@@ -23,6 +23,8 @@ class Adapt(SCANVAE):
     * ``projection_layer``: scGPT embedding → latent
     * ``decoder``: latent → ``X_target`` (marker-gene counts)
     * ``px_r_m0``: NB dispersion for the adaptation decoder
+    * ``alignment_loss_weight``: scalar multiplier on the energy alignment term
+      (which is typically smaller in magnitude than NB reconstruction)
 
     ``Adapt.z_encoder`` (inherited from :class:`SCANVAE`) is **not** used in
     the training objective. Latent alignment always compares
@@ -43,6 +45,7 @@ class Adapt(SCANVAE):
         n_hidden: int = 128,
         n_layers: int = 2,
         dropout_rate: float = 0.1,
+        alignment_loss_weight: float = 10.0,
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         **model_kwargs,
@@ -93,6 +96,7 @@ class Adapt(SCANVAE):
         self.m0 = m0_module
         self.use_m0_loss = True
         self.use_embedding_for_inference = True
+        self.alignment_loss_weight = float(alignment_loss_weight)
         self.stage1_x_m1 = None
         self.stage1_embedding = None
         # Full-dataset adaptation tensors for stage 2 (all query + replay cells).
@@ -177,14 +181,25 @@ class Adapt(SCANVAE):
             tensors["x_m1"] = self.stage2_x_m1[batch_indices].to(device)
         return tensors
 
-    def _adaptation_head_loss(self, tensors, m0_inference_outputs):
-        """Shared adaptation objective (stage 1 and stage 2).
+    def _adaptation_head_loss(
+        self, tensors, m0_inference_outputs, alignment_only=False
+    ):
+        """Shared adaptation objective (stages 1–3).
+
+        .. math::
+
+            L = \\mathrm{NB}(X_{target}) + w \\cdot \\mathrm{energy}(z_{m0}, z_{proj})
+
+        where ``z_proj = projection_layer(embedding)``, ``z_m0`` comes from
+        ``m0``'s gene-count encoder (not ``Adapt.z_encoder``), and ``w`` is
+        ``alignment_loss_weight``.
 
         * NB reconstruction of ``x_m1`` from scgpt ``embedding`` via
           ``projection_layer`` + ``decoder``
-        * Energy score aligning ``projection_layer(embedding)`` to the latent
-          ``z`` from the **frozen/trainable** ``m0`` gene-count encoder (not
-          ``Adapt.z_encoder``).
+        * Energy score aligning ``z_proj`` to ``z_m0``, scaled by ``w``
+
+        When ``m0`` is trainable (stage 3), gradients update ``m0`` through
+        the energy term and the auxiliary head through both terms.
         """
         if "embedding" not in tensors or "x_m1" not in tensors:
             raise KeyError(
@@ -210,13 +225,58 @@ class Adapt(SCANVAE):
         m0_z = m0_inference_outputs["z"]
         if not any(p.requires_grad for p in self.m0.parameters()):
             m0_z = m0_z.detach()
-        energy_score_loss = self.energy_loss(m0_z, z_proj, verbose=False)
-        loss = (reconst_loss_emb + energy_score_loss).mean()
+        energy_score_loss = self.energy_loss(m0_z, z_proj, beta=2, verbose=False)
+        weighted_energy_score_loss = self.alignment_loss_weight * energy_score_loss
+        if alignment_only:
+            loss = weighted_energy_score_loss.mean()
+        else:
+            loss = (reconst_loss_emb + weighted_energy_score_loss).mean()
         return LossRecorder(
             loss=loss,
             reconstruction_loss=reconst_loss_emb.mean(),
             energy_score_loss=energy_score_loss.mean(),
+            weighted_energy_score_loss=weighted_energy_score_loss.mean(),
         )
+
+    @torch.no_grad()
+    def _compute_stage3_log_metrics(
+        self, tensors, m0_inference_outputs, loss_kwargs=None
+    ):
+        """Log-only m0 reconstruction and EWC metrics for stage 3.
+
+        These values are **not** added to the stage-3 optimization objective.
+        """
+        loss_kwargs = dict(loss_kwargs or {})
+        loss_kwargs.setdefault("ewc_importance", 0.0)
+        loss_kwargs.setdefault("feed_labels", False)
+
+        m0_generative_inputs = self.m0._get_generative_input(
+            tensors, m0_inference_outputs
+        )
+        m0_generative_outputs = self.m0.generative(**m0_generative_inputs)
+        m0_losses = self.m0.loss_with_replay(
+            tensors,
+            m0_inference_outputs,
+            m0_generative_outputs,
+            loss_kwargs=loss_kwargs,
+        )
+
+        m0_reconstruction_loss = m0_losses.reconstruction_loss
+        if m0_reconstruction_loss.ndim > 0:
+            m0_reconstruction_loss = m0_reconstruction_loss.mean()
+
+        ewc_loss = getattr(
+            m0_losses,
+            "ewc_loss",
+            torch.zeros((), device=m0_reconstruction_loss.device),
+        )
+        if isinstance(ewc_loss, torch.Tensor) and ewc_loss.ndim > 0:
+            ewc_loss = ewc_loss.mean()
+
+        return {
+            "m0_reconstruction_loss": float(m0_reconstruction_loss.detach().cpu()),
+            "ewc_loss": float(ewc_loss.detach().cpu()),
+        }
 
     @auto_move_data
     def _replay_forward(
