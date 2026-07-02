@@ -254,6 +254,8 @@ class TTA_SCANVI(SCANVI):
         plan_kwargs = dict(plan_kwargs or {})
         if "alignment_loss_weight" in plan_kwargs:
             module.alignment_loss_weight = float(plan_kwargs["alignment_loss_weight"])
+        if "latent_l2_weight" in plan_kwargs:
+            module.latent_l2_weight = float(plan_kwargs["latent_l2_weight"])
 
     @staticmethod
     def _init_adapt_epoch_running():
@@ -261,6 +263,7 @@ class TTA_SCANVI(SCANVI):
             "train_loss": 0.0,
             "adapt_reconstruction_loss": 0.0,
             "energy_score_loss": 0.0,
+            "latent_l2_loss": 0.0,
         }
 
     @staticmethod
@@ -271,6 +274,13 @@ class TTA_SCANVI(SCANVI):
             losses.reconstruction_loss.detach().cpu()
         )
         running["energy_score_loss"] += float(losses.energy_score_loss.detach().cpu())
+        latent_l2 = getattr(losses, "latent_l2_loss", None)
+        if latent_l2 is not None:
+            if isinstance(latent_l2, torch.Tensor):
+                latent_l2 = latent_l2.detach().cpu()
+                if latent_l2.ndim > 0:
+                    latent_l2 = latent_l2.mean()
+            running["latent_l2_loss"] += float(latent_l2)
 
     @staticmethod
     def _finalize_adapt_epoch_running(running, n_batches):
@@ -342,10 +352,13 @@ class TTA_SCANVI(SCANVI):
         This stage runs a direct minibatch torch loop (without Lightning
         TrainRunner). For each cell:
 
-        * gene counts ``X`` are encoded by **frozen** ``m0.z_encoder`` → ``z``
-        * scgpt embeddings are mapped by ``projection_layer`` → ``z_emb``
-        * loss = NB reconstruction of ``x_adapt_key`` from ``z_emb`` + energy
-          score between ``z`` and ``z_emb``
+        * gene counts ``X`` are encoded by **frozen** ``m0.z_encoder`` → ``z_m0``
+        * scgpt embeddings are mapped by ``projection_layer`` → ``z_proj``
+        * three-phase curriculum (when warmups are set):
+
+          1. NB reconstruction of ``x_adapt_key`` only
+          2. energy + latent L2 alignment to ``z_m0`` only
+          3. joint NB + alignment
 
         ``Adapt.z_encoder`` is not used. Only ``projection_layer``,
         ``decoder``, and ``px_r_m0`` are trained; ``m0`` stays frozen.
@@ -369,9 +382,11 @@ class TTA_SCANVI(SCANVI):
             Fraction of cells used for training (default 0.9).
         plan_kwargs
             Optional dict with ``lr``, ``weight_decay``,
-            ``alignment_loss_weight`` (scales energy alignment vs NB recon), and
-            ``alignment_warmup_epochs`` (train on energy alignment only for the
-            first N epochs before adding NB reconstruction).
+            ``alignment_loss_weight`` (scales energy alignment vs NB recon),
+            ``latent_l2_weight`` (MSE between ``z_proj`` and frozen ``z_m0``),
+            ``reconstruction_warmup_epochs`` (NB recon only, default 0),
+            and ``alignment_warmup_epochs`` (energy + L2 only before joint
+            training; default 0).
 
         Examples
         --------
@@ -453,6 +468,9 @@ class TTA_SCANVI(SCANVI):
         # Keep optimizer configurable via plan_kwargs to match existing API style.
         plan_kwargs = dict(plan_kwargs or {})
         self._apply_plan_alignment_weight(self.module, plan_kwargs)
+        reconstruction_warmup_epochs = int(
+            plan_kwargs.get("reconstruction_warmup_epochs", 0)
+        )
         alignment_warmup_epochs = int(plan_kwargs.get("alignment_warmup_epochs", 0))
         lr = float(plan_kwargs.get("lr", 1e-3))
         weight_decay = float(plan_kwargs.get("weight_decay", 1e-6))
@@ -471,9 +489,15 @@ class TTA_SCANVI(SCANVI):
 
         epoch_hist = {key: [] for key in self._init_adapt_epoch_running()}
         for epoch_idx in range(max_epochs):
-            alignment_only = (
-                alignment_warmup_epochs > 0 and epoch_idx < alignment_warmup_epochs
-            )
+            if epoch_idx < reconstruction_warmup_epochs:
+                reconstruction_only = True
+                alignment_only = False
+            elif epoch_idx < reconstruction_warmup_epochs + alignment_warmup_epochs:
+                reconstruction_only = False
+                alignment_only = True
+            else:
+                reconstruction_only = False
+                alignment_only = False
             perm = np.random.permutation(train_idx)
             running = self._init_adapt_epoch_running()
             n_batches = 0
@@ -519,7 +543,10 @@ class TTA_SCANVI(SCANVI):
                         **m0_inference_inputs
                     )
                 losses = self.module._adaptation_head_loss(
-                    tensors, m0_inference_outputs, alignment_only=alignment_only
+                    tensors,
+                    m0_inference_outputs,
+                    alignment_only=alignment_only,
+                    reconstruction_only=reconstruction_only,
                 )
                 loss = losses.loss if losses.loss.ndim == 0 else losses.loss.mean()
                 if not torch.isfinite(loss):

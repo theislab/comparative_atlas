@@ -46,6 +46,7 @@ class Adapt(SCANVAE):
         n_layers: int = 2,
         dropout_rate: float = 0.1,
         alignment_loss_weight: float = 10.0,
+        latent_l2_weight: float = 10.0,
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         **model_kwargs,
@@ -97,6 +98,7 @@ class Adapt(SCANVAE):
         self.use_m0_loss = True
         self.use_embedding_for_inference = True
         self.alignment_loss_weight = float(alignment_loss_weight)
+        self.latent_l2_weight = float(latent_l2_weight)
         self.stage1_x_m1 = None
         self.stage1_embedding = None
         # Full-dataset adaptation tensors for stage 2 (all query + replay cells).
@@ -182,24 +184,31 @@ class Adapt(SCANVAE):
         return tensors
 
     def _adaptation_head_loss(
-        self, tensors, m0_inference_outputs, alignment_only=False
+        self,
+        tensors,
+        m0_inference_outputs,
+        alignment_only=False,
+        reconstruction_only=False,
     ):
         """Shared adaptation objective (stages 1–3).
 
         .. math::
 
-            L = \\mathrm{NB}(X_{target}) + w \\cdot \\mathrm{energy}(z_{m0}, z_{proj})
+            L = \\mathrm{NB}(X_{target})
+            + w_{align} \\cdot \\mathrm{energy}(z_{m0}, z_{proj})
+            + w_{l2} \\cdot \\| z_{m0} - z_{proj} \\|^2
 
         where ``z_proj = projection_layer(embedding)``, ``z_m0`` comes from
-        ``m0``'s gene-count encoder (not ``Adapt.z_encoder``), and ``w`` is
-        ``alignment_loss_weight``.
+        ``m0``'s gene-count encoder (not ``Adapt.z_encoder``).
 
         * NB reconstruction of ``x_m1`` from scgpt ``embedding`` via
           ``projection_layer`` + ``decoder``
-        * Energy score aligning ``z_proj`` to ``z_m0``, scaled by ``w``
+        * Energy score and L2 penalty aligning ``z_proj`` to ``z_m0``
 
-        When ``m0`` is trainable (stage 3), gradients update ``m0`` through
-        the energy term and the auxiliary head through both terms.
+        Stage 1 may set ``reconstruction_only`` or ``alignment_only`` for
+        curriculum phases. When ``m0`` is trainable (stage 3), gradients update
+        ``m0`` through the alignment terms and the auxiliary head through all
+        active terms.
         """
         if "embedding" not in tensors or "x_m1" not in tensors:
             raise KeyError(
@@ -226,16 +235,26 @@ class Adapt(SCANVAE):
         if not any(p.requires_grad for p in self.m0.parameters()):
             m0_z = m0_z.detach()
         energy_score_loss = self.energy_loss(m0_z, z_proj, beta=2, verbose=False)
-        weighted_energy_score_loss = self.alignment_loss_weight * energy_score_loss
-        if alignment_only:
-            loss = weighted_energy_score_loss.mean()
+        latent_l2_loss = ((z_proj - m0_z) ** 2).mean(dim=-1)
+        recon_mean = reconst_loss_emb.mean()
+        energy_mean = energy_score_loss.mean()
+        l2_mean = latent_l2_loss.mean()
+        alignment_mean = (
+            self.alignment_loss_weight * energy_mean
+            + self.latent_l2_weight * l2_mean
+        )
+        if reconstruction_only:
+            loss = recon_mean
+        elif alignment_only:
+            loss = alignment_mean
         else:
-            loss = (reconst_loss_emb + weighted_energy_score_loss).mean()
+            loss = recon_mean + alignment_mean
         return LossRecorder(
             loss=loss,
-            reconstruction_loss=reconst_loss_emb.mean(),
-            energy_score_loss=energy_score_loss.mean(),
-            weighted_energy_score_loss=weighted_energy_score_loss.mean(),
+            reconstruction_loss=recon_mean,
+            energy_score_loss=energy_mean,
+            latent_l2_loss=l2_mean,
+            weighted_energy_score_loss=(self.alignment_loss_weight * energy_mean),
         )
 
     @torch.no_grad()
