@@ -4,7 +4,6 @@ from anndata import AnnData
 from typing import Literal
 
 from scvi import REGISTRY_KEYS
-from scvi.nn import FCLayers
 from scvi.module.base import LossRecorder, auto_move_data
 from scvi.nn import DecoderSCVI
 from scvi.distributions import NegativeBinomial
@@ -15,12 +14,28 @@ import numpy as np
 from typing import Optional, Tuple, Union
 from torch.linalg import vector_norm
 
+
+class LLaVAStyleProjector(torch.nn.Module):
+    """Two-layer MLP projector: Linear → GELU → Linear (no batch/layer norm)."""
+
+    def __init__(self, n_in: int, n_hidden: int, n_out: int):
+        super().__init__()
+        self.proj = torch.nn.Sequential(
+            torch.nn.Linear(n_in, n_hidden),
+            torch.nn.GELU(),
+            torch.nn.Linear(n_hidden, n_out),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
 class Adapt(SCANVAE):
     """Adaptation module: map scGPT embeddings into the SCANVI latent space.
 
     The module wraps a pretrained SCANVI backbone (``m0``) and adds:
 
-    * ``projection_layer``: scGPT embedding → latent
+    * ``projection_layer``: scGPT embedding → latent (LLaVA-style 2-layer GELU MLP)
     * ``decoder``: latent → ``X_target`` (marker-gene counts)
     * ``px_r_m0``: NB dispersion for the adaptation decoder
     * ``alignment_loss_weight``: scalar multiplier on the energy alignment term
@@ -72,14 +87,10 @@ class Adapt(SCANVAE):
             use_layer_norm=use_layer_norm,
             **model_kwargs,
         )
-        self.projection_layer = FCLayers(
+        self.projection_layer = LLaVAStyleProjector(
             n_in=n_input,
-            n_out=m0_module.n_latent,
-            n_layers=n_layers,
             n_hidden=n_hidden,
-            dropout_rate=dropout_rate,
-            use_batch_norm=use_batch_norm,
-            use_layer_norm=use_layer_norm,
+            n_out=m0_module.n_latent,
         )
         self.decoder = DecoderSCVI(
             n_input=m0_module.n_latent,
