@@ -126,14 +126,17 @@ class TTA_SCANVI(SCANVI):
 
     The workflow is explicitly split into two function calls:
 
-    1. :meth:`train_stage1_adaptation` — frozen ``m0`` encodes gene counts to
-       ``z``; ``projection_layer`` maps embeddings to ``z_proj``; loss =
-       NB reconstruction of ``x_adapt_key`` + energy score between ``z`` and
-       ``z_proj``. Only the adaptation head is trained.
+    1. :meth:`train_stage1_adaptation` — frozen ``m0``; train ``projection_layer``
+       and adapt ``decoder``. Loss = NB reconstruction of ``x_adapt_key`` plus
+       full ``adata.X`` reconstruction through the frozen ``m0`` decoder from
+       ``z_proj``.
     2. :meth:`load_query_data_with_replay_stage2` — attaches stage-1 weights,
-       sets up SCANVI replay + EWC on ``m0``, and trains jointly: replay/EWC
-       on ``adata.X`` plus the same adaptation loss on **every** cell (query and
-       replay), using the same minibatch rows.
+       sets up SCANVI replay + EWC on ``m0``, and trains jointly on every cell:
+
+       * ``L_m0``: SCANVI replay + EWC on ``adata.X`` (continual-learning loss)
+       * ``L_adapt``: NB reconstruction of ``x_adapt_key`` plus energy alignment
+         of ``z_proj`` to ``m0``'s gene-count latent ``z`` (no L2)
+       * ``L = L_m0 + L_adapt``; both ``m0`` and the adaptation head are updated
     3. :meth:`train_test_time_adaptation` — on a stage-2 model, fine-tune on new
        query cells with :math:`L = \\mathrm{NB}(X_{target}) + w \\cdot
        \\mathrm{energy}(z_{m0}, z_{proj})`. Both ``m0`` (via the energy term)
@@ -254,8 +257,29 @@ class TTA_SCANVI(SCANVI):
         plan_kwargs = dict(plan_kwargs or {})
         if "alignment_loss_weight" in plan_kwargs:
             module.alignment_loss_weight = float(plan_kwargs["alignment_loss_weight"])
-        if "latent_l2_weight" in plan_kwargs:
-            module.latent_l2_weight = float(plan_kwargs["latent_l2_weight"])
+
+    @staticmethod
+    def _init_stage1_epoch_running():
+        return {
+            "train_loss": 0.0,
+            "adapt_reconstruction_loss": 0.0,
+            "m0_decoder_reconstruction_loss": 0.0,
+        }
+
+    @staticmethod
+    def _update_stage1_epoch_running(running, losses):
+        total = losses.loss if losses.loss.ndim == 0 else losses.loss.mean()
+        running["train_loss"] += float(total.detach().cpu())
+        running["adapt_reconstruction_loss"] += float(
+            losses.reconstruction_loss.detach().cpu()
+        )
+        m0_dec = getattr(losses, "m0_decoder_reconstruction_loss", None)
+        if m0_dec is not None:
+            if isinstance(m0_dec, torch.Tensor):
+                m0_dec = m0_dec.detach().cpu()
+                if m0_dec.ndim > 0:
+                    m0_dec = m0_dec.mean()
+            running["m0_decoder_reconstruction_loss"] += float(m0_dec)
 
     @staticmethod
     def _init_adapt_epoch_running():
@@ -352,16 +376,13 @@ class TTA_SCANVI(SCANVI):
         This stage runs a direct minibatch torch loop (without Lightning
         TrainRunner). For each cell:
 
-        * gene counts ``X`` are encoded by **frozen** ``m0.z_encoder`` → ``z_m0``
         * scgpt embeddings are mapped by ``projection_layer`` → ``z_proj``
-        * three-phase curriculum (when warmups are set):
+        * ``Adapt.decoder`` reconstructs ``x_adapt_key`` from ``z_proj``
+        * frozen ``m0.decoder`` reconstructs full gene counts ``X`` from
+          ``z_proj``
 
-          1. NB reconstruction of ``x_adapt_key`` only
-          2. energy + latent L2 alignment to ``z_m0`` only
-          3. joint NB + alignment
-
-        ``Adapt.z_encoder`` is not used. Only ``projection_layer``,
-        ``decoder``, and ``px_r_m0`` are trained; ``m0`` stays frozen.
+        Only ``projection_layer``, ``decoder``, and ``px_r_m0`` are trained;
+        ``m0`` stays frozen.
 
         Parameters
         ----------
@@ -369,8 +390,7 @@ class TTA_SCANVI(SCANVI):
             AnnData with SCANVI-registered ``adata.X`` (gene counts) and
             ``adata.obsm[embedding_key]``, ``adata.obsm[x_adapt_key]``.
         embedding_key
-            ``obsm`` key for scGPT embeddings (encoder input to
-            ``projection_layer``).
+            ``obsm`` key for scGPT embeddings (input to ``projection_layer``).
         x_adapt_key
             ``obsm`` key for marker-gene counts reconstructed by
             ``Adapt.decoder``.
@@ -381,12 +401,7 @@ class TTA_SCANVI(SCANVI):
         train_size
             Fraction of cells used for training (default 0.9).
         plan_kwargs
-            Optional dict with ``lr``, ``weight_decay``,
-            ``alignment_loss_weight`` (scales energy alignment vs NB recon),
-            ``latent_l2_weight`` (MSE between ``z_proj`` and frozen ``z_m0``),
-            ``reconstruction_warmup_epochs`` (NB recon only, default 0),
-            and ``alignment_warmup_epochs`` (energy + L2 only before joint
-            training; default 0).
+            Optional dict with ``lr`` and ``weight_decay``.
 
         Examples
         --------
@@ -467,11 +482,6 @@ class TTA_SCANVI(SCANVI):
 
         # Keep optimizer configurable via plan_kwargs to match existing API style.
         plan_kwargs = dict(plan_kwargs or {})
-        self._apply_plan_alignment_weight(self.module, plan_kwargs)
-        reconstruction_warmup_epochs = int(
-            plan_kwargs.get("reconstruction_warmup_epochs", 0)
-        )
-        alignment_warmup_epochs = int(plan_kwargs.get("alignment_warmup_epochs", 0))
         lr = float(plan_kwargs.get("lr", 1e-3))
         weight_decay = float(plan_kwargs.get("weight_decay", 1e-6))
         params = [p for p in self.module.parameters() if p.requires_grad]
@@ -487,19 +497,10 @@ class TTA_SCANVI(SCANVI):
         if len(train_idx) == 0:
             raise ValueError("Stage-1 train split is empty; increase `train_size`.")
 
-        epoch_hist = {key: [] for key in self._init_adapt_epoch_running()}
+        epoch_hist = {key: [] for key in self._init_stage1_epoch_running()}
         for epoch_idx in range(max_epochs):
-            if epoch_idx < reconstruction_warmup_epochs:
-                reconstruction_only = True
-                alignment_only = False
-            elif epoch_idx < reconstruction_warmup_epochs + alignment_warmup_epochs:
-                reconstruction_only = False
-                alignment_only = True
-            else:
-                reconstruction_only = False
-                alignment_only = False
             perm = np.random.permutation(train_idx)
-            running = self._init_adapt_epoch_running()
+            running = self._init_stage1_epoch_running()
             n_batches = 0
             for i in range(0, len(perm), batch_size):
                 idx = perm[i : i + batch_size]
@@ -537,17 +538,7 @@ class TTA_SCANVI(SCANVI):
                     )
 
                 optimizer.zero_grad()
-                with torch.no_grad():
-                    m0_inference_inputs = self.module.m0._get_inference_input(tensors)
-                    m0_inference_outputs = self.module.m0.inference(
-                        **m0_inference_inputs
-                    )
-                losses = self.module._adaptation_head_loss(
-                    tensors,
-                    m0_inference_outputs,
-                    alignment_only=alignment_only,
-                    reconstruction_only=reconstruction_only,
-                )
+                losses = self.module._stage1_adaptation_loss(tensors)
                 loss = losses.loss if losses.loss.ndim == 0 else losses.loss.mean()
                 if not torch.isfinite(loss):
                     raise RuntimeError(
@@ -560,7 +551,7 @@ class TTA_SCANVI(SCANVI):
                     )
                 loss.backward()
                 optimizer.step()
-                self._update_adapt_epoch_running(running, losses)
+                self._update_stage1_epoch_running(running, losses)
                 n_batches += 1
 
             finalized = self._finalize_adapt_epoch_running(running, n_batches)
@@ -847,13 +838,14 @@ class TTA_SCANVI(SCANVI):
 
         The stage-2 objective on **every cell** (query and replay) is:
 
-        * NB reconstruction of ``x_adapt_key`` from the scgpt embedding via the
-          adaptation head, plus an energy score aligning ``projection_layer(z)``
-          to ``m0``'s gene-count latent ``z``, and
-        * the standard SCANVI replay loss plus EWC on gene counts via ``m0``.
+        .. math::
 
-        Both terms are evaluated on the same minibatch rows, so the model learns
-        to align the embedding and gene-count representations jointly.
+            L = L_{m0} + L_{adapt}
+
+        where ``L_{m0}`` is the SCANVI replay + EWC loss on gene counts and
+        ``L_{adapt} = \\mathrm{NB}(X_{target}) + w \\cdot \\mathrm{energy}(z_{m0},
+        z_{proj})``. Both ``m0`` and the adaptation head receive gradients from
+        this combined objective (``m0`` also through ``z_{m0}`` in the energy term).
 
         Parameters
         ----------
