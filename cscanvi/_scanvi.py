@@ -642,9 +642,11 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         model.to_device(device)
 
         # make a copy of the model so that it is protected from change when computing importances
-        old_model = deepcopy(model)
+        # model.module.load_state_dict(load_state_dict)
+        # old_model = deepcopy(model)
 
         # model tweaking
+        # Extend checkpoint weights for new batch (and other categorical) columns, then load.
         new_state_dict = model.module.state_dict()
         for key, load_ten in load_state_dict.items():
             new_ten = new_state_dict[key]
@@ -658,7 +660,12 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
 
         model.module.load_state_dict(load_state_dict)
         # was this potentially a wrong place to make a copy?
-        old_model_batch_extend = deepcopy(model)
+        # old_model_batch_extend = deepcopy(model)
+        # Snapshot after padded load: reference checkpoint + extended batch cols.
+        # old_model is evaluated only on replay / seen-batch data; the same weights
+        # are reused for control Fisher and as the EWC anchor (matching trainable shapes).
+        old_model = deepcopy(model)
+        old_model_batch_extend = old_model
         model.module.eval()
         
         
@@ -725,10 +732,11 @@ class SCANVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             # model.module.register_buffer("ctrl_importances", ctrl_importances)
         
         #check this may need to be old_model_batch_extend instead
-        model.module.old_params =  [
+        model.module.old_params = [
                 (k, p.clone().detach())
-                for k, p in old_model.module.named_parameters() if p.requires_grad
-                # for k, p in old_model.module.named_parameters() if requires_penalty(k)
+                for k, p in old_model_batch_extend.module.named_parameters() if p.requires_grad
+                # for k, p in old_model.module.named_parameters() if p.requires_grad
+                # for k, p in old_model_batch_extend.module.named_parameters() if requires_penalty(k)
             ]
         # old_params = [
         #         (k, p.clone().detach())
